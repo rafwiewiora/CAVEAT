@@ -9,6 +9,9 @@ from caveat.geometry import (
     embed_fragment,
     get_exit_vector,
     compute_vector_pair_descriptor,
+    align_single_vector,
+    align_two_vectors,
+    apply_transform,
     _angle,
     _dihedral,
     canonicalize_dihedral,
@@ -126,6 +129,135 @@ class TestGetExitVector:
         # Origin should be at the neighbor position
         pos = np.array(conf.GetAtomPosition(neighbor_idx))
         assert np.allclose(ev.origin, pos, atol=1e-5)
+
+
+class TestApplyTransform:
+    def test_identity_preserves_positions(self):
+        positions = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+        result = apply_transform(positions, np.eye(4))
+        np.testing.assert_allclose(result, positions, atol=1e-10)
+
+    def test_translation(self):
+        positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        T = np.eye(4)
+        T[:3, 3] = [10.0, 20.0, 30.0]
+        result = apply_transform(positions, T)
+        expected = np.array([[10.0, 20.0, 30.0], [11.0, 20.0, 30.0]])
+        np.testing.assert_allclose(result, expected, atol=1e-10)
+
+    def test_rotation_90_z(self):
+        positions = np.array([[1.0, 0.0, 0.0]])
+        R = np.eye(4)
+        R[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+        result = apply_transform(positions, R)
+        expected = np.array([[0.0, 1.0, 0.0]])
+        np.testing.assert_allclose(result, expected, atol=1e-10)
+
+
+class TestAlignSingleVector:
+    def test_translation_only(self):
+        """When vectors already point the same way, only translation needed."""
+        frag_neighbor = np.array([0.0, 0.0, 0.0])
+        frag_dummy = np.array([1.0, 0.0, 0.0])
+        target_pos = np.array([5.0, 5.0, 5.0])
+        target_dir = np.array([6.0, 5.0, 5.0])
+
+        frag_positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
+        transform = align_single_vector(frag_positions, frag_neighbor, frag_dummy, target_pos, target_dir)
+        result = apply_transform(frag_positions, transform)
+
+        # Neighbor should land at target_pos
+        np.testing.assert_allclose(result[0], target_pos, atol=1e-6)
+        # Dummy should be along the target direction from neighbor
+        moved_dir = result[1] - result[0]
+        expected_dir = target_dir - target_pos
+        moved_dir /= np.linalg.norm(moved_dir)
+        expected_dir /= np.linalg.norm(expected_dir)
+        np.testing.assert_allclose(moved_dir, expected_dir, atol=1e-6)
+
+    def test_rotation_and_translation(self):
+        """Fragment exit vector along X, target along Y."""
+        frag_neighbor = np.array([0.0, 0.0, 0.0])
+        frag_dummy = np.array([1.0, 0.0, 0.0])
+        target_pos = np.array([3.0, 3.0, 3.0])
+        target_dir = np.array([3.0, 4.0, 3.0])  # Y direction
+
+        frag_positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        transform = align_single_vector(frag_positions, frag_neighbor, frag_dummy, target_pos, target_dir)
+        result = apply_transform(frag_positions, transform)
+
+        # Neighbor at target
+        np.testing.assert_allclose(result[0], target_pos, atol=1e-6)
+        # Exit vector direction aligned
+        moved_dir = result[1] - result[0]
+        expected_dir = target_dir - target_pos
+        moved_dir /= np.linalg.norm(moved_dir)
+        expected_dir /= np.linalg.norm(expected_dir)
+        np.testing.assert_allclose(moved_dir, expected_dir, atol=1e-6)
+
+    def test_opposite_vectors(self):
+        """Fragment exit vector opposite to target direction."""
+        frag_neighbor = np.array([0.0, 0.0, 0.0])
+        frag_dummy = np.array([1.0, 0.0, 0.0])
+        target_pos = np.array([0.0, 0.0, 0.0])
+        target_dir = np.array([-1.0, 0.0, 0.0])
+
+        frag_positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        transform = align_single_vector(frag_positions, frag_neighbor, frag_dummy, target_pos, target_dir)
+        result = apply_transform(frag_positions, transform)
+
+        np.testing.assert_allclose(result[0], target_pos, atol=1e-6)
+        moved_dir = result[1] - result[0]
+        expected_dir = np.array([-1.0, 0.0, 0.0])
+        moved_dir /= np.linalg.norm(moved_dir)
+        np.testing.assert_allclose(moved_dir, expected_dir, atol=1e-6)
+
+
+class TestAlignTwoVectors:
+    def test_identity_case(self):
+        """Source and target are the same — transform should be identity-like."""
+        pts = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+        ])
+        transform = align_two_vectors(pts, pts)
+        result = apply_transform(pts, transform)
+        np.testing.assert_allclose(result, pts, atol=1e-6)
+
+    def test_pure_translation(self):
+        """Points shifted by a constant offset."""
+        source = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ])
+        offset = np.array([5.0, 10.0, 15.0])
+        target = source + offset
+        transform = align_two_vectors(source, target)
+        result = apply_transform(source, transform)
+        np.testing.assert_allclose(result, target, atol=1e-6)
+
+    def test_rotation_90_z(self):
+        """90° rotation around Z axis."""
+        source = np.array([
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ])
+        # Rotate 90° around Z: (x,y) -> (-y, x)
+        target = np.array([
+            [0.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [-1.0, 2.0, 0.0],
+        ])
+        transform = align_two_vectors(source, target)
+        result = apply_transform(source, transform)
+        np.testing.assert_allclose(result, target, atol=1e-5)
 
 
 class TestComputeVectorPairDescriptor:

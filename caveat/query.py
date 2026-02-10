@@ -193,7 +193,10 @@ def find_replacements(
 
 
 def _find_cut_bonds(mol: Chem.Mol, match_atoms: set[int]) -> list[CutBond]:
-    """Find bonds that cross the boundary between matched and unmatched atoms."""
+    """Find bonds that cross the boundary between matched and unmatched atoms.
+
+    Only returns heavy-atom cut bonds (skips bonds to hydrogen).
+    """
     cut_bonds = []
     for bond in mol.GetBonds():
         a1 = bond.GetBeginAtomIdx()
@@ -201,6 +204,11 @@ def _find_cut_bonds(mol: Chem.Mol, match_atoms: set[int]) -> list[CutBond]:
         if (a1 in match_atoms) != (a2 in match_atoms):
             matched = a1 if a1 in match_atoms else a2
             external = a2 if a1 in match_atoms else a1
+            # Skip H atoms — they're not real attachment points
+            if mol.GetAtomWithIdx(external).GetAtomicNum() == 1:
+                continue
+            if mol.GetAtomWithIdx(matched).GetAtomicNum() == 1:
+                continue
             cut_bonds.append(CutBond(
                 matched_atom_idx=matched,
                 external_atom_idx=external,

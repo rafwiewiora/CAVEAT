@@ -1,11 +1,13 @@
 """Tests for assemble module."""
 
+import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDistGeom
 
 from caveat.assemble import assemble
 from caveat.fragment import AttachmentPoint, BRICSFragmenter
+from caveat.geometry import embed_fragment
 
 
 def _make_3d(mol):
@@ -105,3 +107,63 @@ class TestAssemble:
             smi = Chem.MolToSmiles(result)
             reparsed = Chem.MolFromSmiles(smi)
             assert reparsed is not None
+
+    def test_parent_coords_preserved(self):
+        """After assembly with 3D parent + 3D fragment, parent atoms stay in place."""
+        parent = Chem.MolFromSmiles("c1ccccc1OC")
+        parent3d = _make_3d(parent)
+
+        # Match methyl on the Hs-added mol
+        query = Chem.MolFromSmarts("[CH3]")
+        matches = parent3d.GetSubstructMatches(query)
+        assert matches
+        match_atoms = matches[0]
+        match_set = set(match_atoms)
+
+        # Also include Hs exclusively bonded to matched atoms
+        for atom in parent3d.GetAtoms():
+            if atom.GetAtomicNum() == 1 and atom.GetIdx() not in match_set:
+                nbrs = atom.GetNeighbors()
+                if len(nbrs) == 1 and nbrs[0].GetIdx() in match_set:
+                    match_set.add(atom.GetIdx())
+
+        # Replacement: ethyl fragment [3*]CC with 3D conformer
+        replacement = Chem.MolFromSmiles("[3*]CC")
+        replacement_3d = embed_fragment(replacement, n_confs=1)
+        # Find AP on the 3D mol
+        ap = None
+        for atom in replacement_3d.GetAtoms():
+            if atom.GetAtomicNum() == 0:
+                ap = AttachmentPoint(
+                    dummy_atom_idx=atom.GetIdx(),
+                    neighbor_atom_idx=atom.GetNeighbors()[0].GetIdx(),
+                    brics_label=3,
+                )
+                break
+        assert ap is not None
+
+        result = assemble(parent3d, match_atoms, replacement_3d, [ap])
+        assert result is not None
+        assert result.GetNumConformers() > 0
+
+        # Verify parent atom positions are preserved
+        parent_conf = parent3d.GetConformer(0)
+        result_conf = result.GetConformer(0)
+
+        # Build the parent_map: parent atoms not in match_set, mapped to result indices
+        # (mirrors logic in _assemble_impl)
+        parent_map = {}
+        new_idx = 0
+        for atom in parent3d.GetAtoms():
+            if atom.GetIdx() not in match_set:
+                parent_map[atom.GetIdx()] = new_idx
+                new_idx += 1
+
+        for old_idx, new_idx in parent_map.items():
+            if new_idx < result.GetNumAtoms():
+                orig_pos = np.array(list(parent_conf.GetAtomPosition(old_idx)))
+                result_pos = np.array(list(result_conf.GetAtomPosition(new_idx)))
+                dist = np.linalg.norm(orig_pos - result_pos)
+                assert dist < 0.5, (
+                    f"Parent atom {old_idx} (result {new_idx}) moved {dist:.3f} Å"
+                )

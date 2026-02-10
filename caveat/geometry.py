@@ -181,6 +181,166 @@ def _dihedral(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> flo
     return float(np.degrees(np.arctan2(-y, x)))
 
 
+def align_single_vector(
+    frag_positions: np.ndarray,
+    frag_neighbor_pos: np.ndarray,
+    frag_dummy_pos: np.ndarray,
+    target_pos: np.ndarray,
+    target_direction_pos: np.ndarray,
+) -> np.ndarray:
+    """Compute rigid-body transform to align a 1-AP fragment to a target position.
+
+    Translates the fragment so its AP neighbor lands at target_pos, then rotates
+    so the exit vector (neighbor→dummy) aligns with the target direction
+    (external→internal on parent). Uses Rodrigues' rotation formula.
+
+    Args:
+        frag_positions: Nx3 array of all fragment atom positions
+        frag_neighbor_pos: position of the fragment's AP neighbor atom
+        frag_dummy_pos: position of the fragment's dummy atom
+        target_pos: where the AP neighbor should end up (parent external atom)
+        target_direction_pos: direction target (parent internal/matched atom)
+
+    Returns:
+        4x4 homogeneous transformation matrix
+    """
+    # Fragment exit vector: neighbor → dummy
+    frag_vec = frag_dummy_pos - frag_neighbor_pos
+    frag_vec_norm = np.linalg.norm(frag_vec)
+    if frag_vec_norm < 1e-8:
+        return np.eye(4)
+    frag_vec = frag_vec / frag_vec_norm
+
+    # Target direction: external → internal (matching the exit vector convention)
+    target_vec = target_direction_pos - target_pos
+    target_vec_norm = np.linalg.norm(target_vec)
+    if target_vec_norm < 1e-8:
+        return np.eye(4)
+    target_vec = target_vec / target_vec_norm
+
+    # Step 1: Translation to move fragment neighbor to origin
+    T1 = np.eye(4)
+    T1[:3, 3] = -frag_neighbor_pos
+
+    # Step 2: Rotation to align exit vectors (Rodrigues' formula)
+    R = _rotation_matrix_between_vectors(frag_vec, target_vec)
+
+    # Step 3: Translation to target position
+    T2 = np.eye(4)
+    T2[:3, 3] = target_pos
+
+    # Combined: T2 @ R @ T1
+    transform = T2 @ R @ T1
+    return transform
+
+
+def align_two_vectors(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+) -> np.ndarray:
+    """Compute rigid-body transform using Kabsch (SVD) alignment.
+
+    For 2-AP fragments, aligns 4 point pairs:
+    (neighbor1, dummy1, neighbor2, dummy2) on source and target.
+
+    Args:
+        source_points: Nx3 array of source points (N >= 3)
+        target_points: Nx3 array of target points (same N)
+
+    Returns:
+        4x4 homogeneous transformation matrix
+    """
+    assert source_points.shape == target_points.shape
+    assert source_points.shape[0] >= 2
+
+    # Centroids
+    src_centroid = source_points.mean(axis=0)
+    tgt_centroid = target_points.mean(axis=0)
+
+    # Center the points
+    src_centered = source_points - src_centroid
+    tgt_centered = target_points - tgt_centroid
+
+    # Kabsch: compute optimal rotation via SVD
+    H = src_centered.T @ tgt_centered
+    U, S, Vt = np.linalg.svd(H)
+
+    # Correct for reflection
+    d = np.linalg.det(Vt.T @ U.T)
+    sign_matrix = np.diag([1.0, 1.0, np.sign(d)])
+    R = Vt.T @ sign_matrix @ U.T
+
+    # Build 4x4 transform
+    transform = np.eye(4)
+    transform[:3, :3] = R
+    transform[:3, 3] = tgt_centroid - R @ src_centroid
+    return transform
+
+
+def apply_transform(positions: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 rigid-body transform to an Nx3 array of positions.
+
+    Args:
+        positions: Nx3 array of 3D positions
+        transform: 4x4 homogeneous transformation matrix
+
+    Returns:
+        Nx3 array of transformed positions
+    """
+    N = positions.shape[0]
+    # Convert to homogeneous coordinates
+    ones = np.ones((N, 1))
+    homogeneous = np.hstack([positions, ones])  # Nx4
+    transformed = (transform @ homogeneous.T).T  # Nx4
+    return transformed[:, :3]
+
+
+def _rotation_matrix_between_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """Compute 4x4 rotation matrix that rotates v1 onto v2 using Rodrigues' formula.
+
+    Args:
+        v1, v2: unit vectors (3D)
+
+    Returns:
+        4x4 homogeneous rotation matrix
+    """
+    v1 = v1 / (np.linalg.norm(v1) + 1e-10)
+    v2 = v2 / (np.linalg.norm(v2) + 1e-10)
+
+    cross = np.cross(v1, v2)
+    dot = np.dot(v1, v2)
+    sin_angle = np.linalg.norm(cross)
+
+    if sin_angle < 1e-8:
+        # Vectors are parallel
+        if dot > 0:
+            return np.eye(4)  # same direction
+        else:
+            # Opposite direction — rotate 180° around any perpendicular axis
+            perp = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(v1, perp)) > 0.9:
+                perp = np.array([0.0, 1.0, 0.0])
+            axis = np.cross(v1, perp)
+            axis = axis / np.linalg.norm(axis)
+            # 180° rotation: R = 2 * outer(axis, axis) - I
+            R3 = 2.0 * np.outer(axis, axis) - np.eye(3)
+            R = np.eye(4)
+            R[:3, :3] = R3
+            return R
+
+    # Rodrigues' formula: R = I + K + K²/(1+c), where K is skew-symmetric of cross
+    axis = cross / sin_angle
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0],
+    ])
+    R3 = np.eye(3) + K + (K @ K) * (1.0 / (1.0 + dot))
+    R = np.eye(4)
+    R[:3, :3] = R3
+    return R
+
+
 def canonicalize_dihedral(dihedral: float) -> float:
     """Canonicalize dihedral to handle enantiomeric sign convention.
 

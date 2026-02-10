@@ -480,6 +480,35 @@ class FragmentDatabase:
             "source_count": sc,
         }
 
+    def get_attachment_vectors(self, fragment_id: int, conformer_id: int) -> list[dict]:
+        """Retrieve stored exit vector data for a fragment conformer.
+
+        Args:
+            fragment_id: the fragment's database ID
+            conformer_id: the conformer's database ID
+
+        Returns:
+            list of dicts with 'ap_index', 'origin' (np.ndarray), 'direction' (np.ndarray)
+        """
+        rows = self.conn.execute(
+            """SELECT ap_index, origin_x, origin_y, origin_z,
+                      direction_x, direction_y, direction_z
+               FROM attachment_vectors
+               WHERE fragment_id = ? AND conformer_id = ?
+               ORDER BY ap_index""",
+            (fragment_id, conformer_id),
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            ap_idx, ox, oy, oz, dx, dy, dz = row
+            result.append({
+                "ap_index": ap_idx,
+                "origin": np.array([ox, oy, oz]),
+                "direction": np.array([dx, dy, dz]),
+            })
+        return result
+
     def get_sources(self, fragment_id: int) -> list[str]:
         """Get source molecule SMILES for a fragment."""
         rows = self.conn.execute(

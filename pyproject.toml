@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caveat"
+version = "0.1.0"
+description = "Fragment-based molecular replacement tool inspired by CAVEAT"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "numpy",
+    "scipy",
+    "click",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+caveat = "caveat.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["caveat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

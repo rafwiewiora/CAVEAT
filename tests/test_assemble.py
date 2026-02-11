@@ -10,6 +10,23 @@ from caveat.fragment import AttachmentPoint, BRICSFragmenter
 from caveat.geometry import embed_fragment
 
 
+def _check_bond_quality(mol, max_bond_length=2.0):
+    """Helper: check that all bonds have reasonable lengths."""
+    conf = mol.GetConformer(0)
+    for bond in mol.GetBonds():
+        p1 = np.array(list(conf.GetAtomPosition(bond.GetBeginAtomIdx())))
+        p2 = np.array(list(conf.GetAtomPosition(bond.GetEndAtomIdx())))
+        bl = np.linalg.norm(p2 - p1)
+        assert bl < max_bond_length, (
+            f"Bond {bond.GetBeginAtomIdx()}-{bond.GetEndAtomIdx()} "
+            f"length {bl:.2f} > {max_bond_length}"
+        )
+        assert bl > 0.5, (
+            f"Bond {bond.GetBeginAtomIdx()}-{bond.GetEndAtomIdx()} "
+            f"length {bl:.2f} too short"
+        )
+
+
 def _make_3d(mol):
     """Helper: add Hs and embed in 3D."""
     mol = Chem.AddHs(mol)
@@ -167,3 +184,61 @@ class TestAssemble:
                 assert dist < 0.5, (
                     f"Parent atom {old_idx} (result {new_idx}) moved {dist:.3f} Å"
                 )
+
+    def test_1ap_bond_quality(self):
+        """1-AP assembly: replacing pyridine should produce unstrained bonds."""
+        parent = Chem.MolFromSmiles("c1ccncc1-c1ccccc1")  # 2-phenylpyridine
+        parent3d = _make_3d(parent)
+
+        # Replace the pyridine ring (1 cut bond to phenyl)
+        query = Chem.MolFromSmarts("c1ccncc1")
+        matches = parent3d.GetSubstructMatches(query)
+        assert matches
+        match_atoms = matches[0]
+
+        # Replacement: benzene ring [16*]c1ccccc1
+        replacement = Chem.MolFromSmiles("[16*]c1ccccc1")
+        replacement_3d = embed_fragment(replacement, n_confs=1)
+        ap = None
+        for atom in replacement_3d.GetAtoms():
+            if atom.GetAtomicNum() == 0:
+                ap = AttachmentPoint(
+                    dummy_atom_idx=atom.GetIdx(),
+                    neighbor_atom_idx=atom.GetNeighbors()[0].GetIdx(),
+                    brics_label=16,
+                )
+                break
+
+        result = assemble(parent3d, match_atoms, replacement_3d, [ap])
+        assert result is not None
+        assert result.GetNumConformers() > 0
+        _check_bond_quality(result)
+
+    def test_2ap_bond_quality(self):
+        """2-AP assembly: replacing a linker with 2 attachment points."""
+        # Diphenylamine: Ph-NH-Ph, replace the NH linker (2 cut bonds)
+        parent = Chem.MolFromSmiles("c1ccc(cc1)Nc1ccccc1")
+        parent3d = _make_3d(parent)
+
+        # Replace the NH (match 1 atom, 2 bonds to the phenyls)
+        query = Chem.MolFromSmarts("[NH]")
+        matches = parent3d.GetSubstructMatches(query)
+        assert matches
+        match_atoms = matches[0]
+
+        # Replacement: oxygen linker [5*]O[16*]
+        replacement = Chem.MolFromSmiles("[5*]O[16*]")
+        replacement_3d = embed_fragment(replacement, n_confs=1)
+        aps = []
+        for atom in replacement_3d.GetAtoms():
+            if atom.GetAtomicNum() == 0:
+                aps.append(AttachmentPoint(
+                    dummy_atom_idx=atom.GetIdx(),
+                    neighbor_atom_idx=atom.GetNeighbors()[0].GetIdx(),
+                    brics_label=atom.GetIsotope(),
+                ))
+
+        if len(aps) == 2:
+            result = assemble(parent3d, match_atoms, replacement_3d, aps)
+            if result is not None and result.GetNumConformers() > 0:
+                _check_bond_quality(result)

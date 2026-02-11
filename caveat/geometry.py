@@ -192,14 +192,14 @@ def align_single_vector(
 
     Translates the fragment so its AP neighbor lands at target_pos, then rotates
     so the exit vector (neighbor→dummy) aligns with the target direction
-    (external→internal on parent). Uses Rodrigues' rotation formula.
+    (target_pos→target_direction_pos). Uses Rodrigues' rotation formula.
 
     Args:
         frag_positions: Nx3 array of all fragment atom positions
         frag_neighbor_pos: position of the fragment's AP neighbor atom
         frag_dummy_pos: position of the fragment's dummy atom
-        target_pos: where the AP neighbor should end up (parent external atom)
-        target_direction_pos: direction target (parent internal/matched atom)
+        target_pos: where the AP neighbor should end up (parent internal atom)
+        target_direction_pos: direction the exit vector points toward (parent external atom)
 
     Returns:
         4x4 homogeneous transformation matrix
@@ -295,6 +295,69 @@ def apply_transform(positions: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return transformed[:, :3]
 
 
+def refine_rotation_around_axis(
+    anchor_pos: np.ndarray,
+    axis: np.ndarray,
+    frag_ref_dir: np.ndarray,
+    target_ref_dir: np.ndarray,
+) -> np.ndarray:
+    """Compute rotation around an axis to match reference directions.
+
+    After aligning the exit vector (via align_single_vector), the fragment
+    can still rotate freely around the bond axis. This function computes
+    the rotation that best aligns a reference direction in the fragment
+    with a target reference direction.
+
+    Both directions are projected perpendicular to the axis before comparison.
+
+    Args:
+        anchor_pos: pivot point for the rotation (the aligned AP neighbor position)
+        axis: the bond axis (unit vector, exit vector direction)
+        frag_ref_dir: reference direction from the fragment (e.g., neighbor→other_bonds avg)
+        target_ref_dir: reference direction from the parent (e.g., internal→other_bonds avg)
+
+    Returns:
+        4x4 homogeneous transformation matrix
+    """
+    axis = axis / (np.linalg.norm(axis) + 1e-10)
+
+    # Project both directions perpendicular to the axis
+    frag_perp = frag_ref_dir - np.dot(frag_ref_dir, axis) * axis
+    target_perp = target_ref_dir - np.dot(target_ref_dir, axis) * axis
+
+    frag_norm = np.linalg.norm(frag_perp)
+    target_norm = np.linalg.norm(target_perp)
+
+    if frag_norm < 1e-8 or target_norm < 1e-8:
+        return np.eye(4)
+
+    frag_perp /= frag_norm
+    target_perp /= target_norm
+
+    # Signed angle between them around the axis
+    cos_angle = np.clip(np.dot(frag_perp, target_perp), -1.0, 1.0)
+    cross = np.cross(frag_perp, target_perp)
+    sin_angle = np.dot(cross, axis)
+    angle = np.arctan2(sin_angle, cos_angle)
+
+    # Rodrigues rotation around axis by angle, pivoted at anchor_pos
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0],
+    ])
+    R3 = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    T1 = np.eye(4)
+    T1[:3, 3] = -anchor_pos
+    R = np.eye(4)
+    R[:3, :3] = R3
+    T2 = np.eye(4)
+    T2[:3, 3] = anchor_pos
+
+    return T2 @ R @ T1
+
+
 def _rotation_matrix_between_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     """Compute 4x4 rotation matrix that rotates v1 onto v2 using Rodrigues' formula.
 
@@ -328,14 +391,15 @@ def _rotation_matrix_between_vectors(v1: np.ndarray, v2: np.ndarray) -> np.ndarr
             R[:3, :3] = R3
             return R
 
-    # Rodrigues' formula: R = I + K + K²/(1+c), where K is skew-symmetric of cross
+    # Rodrigues' formula: R = I + sin(θ)K + (1-cos(θ))K²
+    # where K is the skew-symmetric matrix of the unit rotation axis
     axis = cross / sin_angle
     K = np.array([
         [0, -axis[2], axis[1]],
         [axis[2], 0, -axis[0]],
         [-axis[1], axis[0], 0],
     ])
-    R3 = np.eye(3) + K + (K @ K) * (1.0 / (1.0 + dot))
+    R3 = np.eye(3) + sin_angle * K + (1.0 - dot) * (K @ K)
     R = np.eye(4)
     R[:3, :3] = R3
     return R

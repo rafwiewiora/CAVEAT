@@ -135,18 +135,38 @@ def find_replacements(
     all_results = {}
     for desc_type, desc_data, conf_idx in descriptors:
         if desc_type == "single":
-            # For single AP fragments, query all 1-AP fragments
-            # No geometric pair to match — rank by other criteria
+            # For single AP fragments, rank by BRICS label compatibility
+            # and heavy atom count similarity (no geometric pair to compare)
+            cb = cut_bonds[0]
+            target_n_heavy = sum(
+                1 for a in match_atoms
+                if mol.GetAtomWithIdx(a).GetAtomicNum() > 1
+            )
+            # Determine if the cut bond enters an aromatic system
+            matched_is_aromatic = mol.GetAtomWithIdx(
+                cb.matched_atom_idx
+            ).GetIsAromatic()
+            aromatic_labels = {7, 8, 9, 14, 15, 16}
+
             rows = db.conn.execute(
-                "SELECT id, canonical_smiles, num_heavy_atoms, source_count FROM fragments WHERE num_attachment_points = 1"
+                """SELECT id, canonical_smiles, num_heavy_atoms, source_count,
+                          brics_labels
+                   FROM fragments WHERE num_attachment_points = 1""",
             ).fetchall()
             for row in rows:
-                fid, smi, nha, sc = row
-                if fid not in all_results:
+                fid, smi, nha, sc, labels_json = row
+                import json as _json
+                labels = _json.loads(labels_json) if labels_json else []
+                # Check if fragment's BRICS label matches the bond character
+                frag_is_aromatic = any(l in aromatic_labels for l in labels)
+                label_penalty = 0.0 if frag_is_aromatic == matched_is_aromatic else 5.0
+                size_dist = abs(nha - target_n_heavy) / max(target_n_heavy, 1)
+                geo_dist = label_penalty + size_dist
+                if fid not in all_results or geo_dist < all_results[fid].geometric_distance:
                     all_results[fid] = ReplacementResult(
                         fragment_id=fid,
                         smiles=smi,
-                        geometric_distance=0.0,
+                        geometric_distance=geo_dist,
                         num_attachment_points=1,
                         num_heavy_atoms=nha,
                         source_count=sc,
@@ -219,14 +239,19 @@ def _find_cut_bonds(mol: Chem.Mol, match_atoms: set[int]) -> list[CutBond]:
 
 
 def _compute_single_exit_vector(conf, cut_bond: CutBond, match_atoms: set[int]):
-    """Compute the exit vector direction for a single cut bond."""
+    """Compute the exit vector direction for a single cut bond.
+
+    Measured from the substructure side (matching fragment convention):
+    origin = matched atom (analogous to fragment neighbor), pointing toward
+    the external atom (analogous to fragment dummy).
+    """
     pos_ext = np.array(conf.GetAtomPosition(cut_bond.external_atom_idx))
     pos_match = np.array(conf.GetAtomPosition(cut_bond.matched_atom_idx))
-    direction = pos_match - pos_ext
+    direction = pos_ext - pos_match
     norm = np.linalg.norm(direction)
     if norm > 1e-6:
         direction = direction / norm
-    return ExitVector(origin=pos_ext, direction=direction, tip=pos_match)
+    return ExitVector(origin=pos_match, direction=direction, tip=pos_ext)
 
 
 def _compute_cut_pair_descriptor(
@@ -234,16 +259,16 @@ def _compute_cut_pair_descriptor(
 ) -> Optional[VectorPairDescriptor]:
     """Compute geometric descriptor for a pair of cut bonds.
 
-    We treat:
-    - b1 = external atom of cut bond 1 (base atom of exit vector 1)
-    - t1 = matched atom of cut bond 1 (tip/dummy direction)
-    - b2 = external atom of cut bond 2
-    - t2 = matched atom of cut bond 2
+    We measure from the substructure side (matching the DB fragment convention):
+    - b1 = matched atom of cut bond 1 (base, analogous to fragment neighbor)
+    - t1 = external atom of cut bond 1 (tip, analogous to fragment dummy)
+    - b2 = matched atom of cut bond 2
+    - t2 = external atom of cut bond 2
     """
     return compute_vector_pair_descriptor(
         conf,
-        dummy1_idx=cb1.matched_atom_idx,
-        neighbor1_idx=cb1.external_atom_idx,
-        dummy2_idx=cb2.matched_atom_idx,
-        neighbor2_idx=cb2.external_atom_idx,
+        dummy1_idx=cb1.external_atom_idx,
+        neighbor1_idx=cb1.matched_atom_idx,
+        dummy2_idx=cb2.external_atom_idx,
+        neighbor2_idx=cb2.matched_atom_idx,
     )

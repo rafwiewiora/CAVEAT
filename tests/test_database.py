@@ -115,3 +115,30 @@ class TestFragmentDatabase:
         stats = db.build(molecules, n_confs=2)
         assert stats["skipped"] == 1
         db.close()
+
+    def test_parallel_build(self, tmp_db_path, simple_molecules):
+        """Parallel build should produce the same results as serial."""
+        import tempfile
+
+        # Build serial
+        db_serial = FragmentDatabase(tmp_db_path)
+        stats_serial = db_serial.build(simple_molecules, n_confs=2, workers=1)
+
+        # Build parallel
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            parallel_path = f.name
+        db_parallel = FragmentDatabase(parallel_path)
+        stats_parallel = db_parallel.build(simple_molecules, n_confs=2, workers=2)
+
+        assert stats_serial["fragments"] == stats_parallel["fragments"]
+        assert stats_serial["molecules"] == stats_parallel["molecules"]
+
+        serial_stats = db_serial.get_stats()
+        parallel_stats = db_parallel.get_stats()
+        assert serial_stats["num_fragments"] == parallel_stats["num_fragments"]
+        assert serial_stats["num_conformers"] == parallel_stats["num_conformers"]
+        assert serial_stats["num_vector_pairs"] == parallel_stats["num_vector_pairs"]
+
+        db_serial.close()
+        db_parallel.close()
+        os.unlink(parallel_path)

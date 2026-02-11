@@ -36,7 +36,10 @@ from caveat.database import FragmentDatabase
 from caveat.fragment import AttachmentPoint
 from caveat.query import find_replacements, _find_cut_bonds
 from caveat.assemble import assemble
-from caveat.geometry import align_single_vector, align_two_vectors, apply_transform
+from caveat.geometry import (
+    align_single_vector, align_two_vectors, apply_transform,
+    refine_rotation_around_axis,
+)
 
 
 def make_3d(mol, n_confs=1, seed=42):
@@ -87,13 +90,40 @@ def align_fragment_to_parent(frag_mol, frag_aps, parent_3d, cut_info):
 
         frag_neighbor_pos = np.array(list(conf.GetAtomPosition(ap.neighbor_atom_idx)))
         frag_dummy_pos = np.array(list(conf.GetAtomPosition(ap.dummy_atom_idx)))
-        target_pos = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
-        target_dir_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+        # neighbor → internal position, exit vector points toward external
+        target_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+        target_dir_pos = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
 
         transform = align_single_vector(
             positions, frag_neighbor_pos, frag_dummy_pos,
             target_pos, target_dir_pos,
         )
+
+        # Refine rotation around the bond axis using subsidiary bonds
+        aligned_tmp = apply_transform(positions, transform)
+        axis = target_dir_pos - target_pos
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm > 1e-8:
+            axis = axis / axis_norm
+            neighbor_atom = frag_mol.GetAtomWithIdx(ap.neighbor_atom_idx)
+            frag_other = [n.GetIdx() for n in neighbor_atom.GetNeighbors()
+                          if n.GetIdx() != ap.dummy_atom_idx]
+            internal_atom = parent_3d.GetAtomWithIdx(ci["internal_idx"])
+            parent_other = [n.GetIdx() for n in internal_atom.GetNeighbors()
+                            if n.GetIdx() != ci["external_idx"]]
+            if frag_other and parent_other:
+                aligned_neighbor = aligned_tmp[ap.neighbor_atom_idx]
+                frag_ref = np.mean([aligned_tmp[i] for i in frag_other], axis=0)
+                frag_ref_dir = frag_ref - aligned_neighbor
+                parent_int_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+                parent_ref = np.mean([np.array(list(parent_conf.GetAtomPosition(i)))
+                                      for i in parent_other], axis=0)
+                parent_ref_dir = parent_ref - parent_int_pos
+                refine = refine_rotation_around_axis(
+                    target_pos, axis, frag_ref_dir, parent_ref_dir,
+                )
+                transform = refine @ transform
+
     elif n_aps >= 2:
         source_pts = []
         target_pts = []
@@ -104,10 +134,11 @@ def align_fragment_to_parent(frag_mol, frag_aps, parent_3d, cut_info):
             frag_dummy_pos = np.array(list(conf.GetAtomPosition(ap.dummy_atom_idx)))
             target_ext = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
             target_int = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+            # neighbor → internal position, dummy → external position
             source_pts.append(frag_neighbor_pos)
             source_pts.append(frag_dummy_pos)
-            target_pts.append(target_ext)
             target_pts.append(target_int)
+            target_pts.append(target_ext)
 
         transform = align_two_vectors(np.array(source_pts), np.array(target_pts))
     else:

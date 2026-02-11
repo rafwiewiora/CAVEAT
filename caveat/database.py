@@ -11,6 +11,7 @@ import json
 import logging
 import sqlite3
 from itertools import combinations
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Optional
 
@@ -89,6 +90,57 @@ ON vector_pairs(fragment_id);
 """
 
 
+def _embed_worker(args):
+    """Worker function for parallel fragment embedding.
+
+    Accepts (smiles, mol_binary, n_confs) and returns a dict with
+    the embedded mol binary and extracted geometric data, or None on failure.
+    """
+    smiles, mol_binary, ap_dicts, n_confs = args
+    mol = Chem.Mol(mol_binary)
+    try:
+        mol3d = embed_fragment(mol, n_confs=n_confs)
+    except Exception:
+        return None
+
+    aps = _find_attachment_points_in_mol(mol3d)
+    conformers = []
+    for conf_idx in range(mol3d.GetNumConformers()):
+        conf = mol3d.GetConformer(conf_idx)
+        energy = _get_conformer_energy(mol3d, conf_idx)
+
+        vectors = []
+        for ap_idx, ap in enumerate(aps):
+            pos_neighbor = np.array(conf.GetAtomPosition(ap.neighbor_atom_idx))
+            pos_dummy = np.array(conf.GetAtomPosition(ap.dummy_atom_idx))
+            direction = pos_dummy - pos_neighbor
+            norm = np.linalg.norm(direction)
+            if norm > 1e-6:
+                direction = direction / norm
+            vectors.append((ap_idx,
+                            pos_neighbor.tolist(), direction.tolist()))
+
+        pairs = []
+        if len(aps) >= 2:
+            for (ai, ap1), (aj, ap2) in combinations(enumerate(aps), 2):
+                desc = compute_vector_pair_descriptor(
+                    conf,
+                    ap1.dummy_atom_idx, ap1.neighbor_atom_idx,
+                    ap2.dummy_atom_idx, ap2.neighbor_atom_idx,
+                )
+                pairs.append((ai, aj,
+                              desc.distance, desc.angle1,
+                              desc.angle2, desc.dihedral))
+
+        conformers.append((conf_idx, energy, vectors, pairs))
+
+    return {
+        "smiles": smiles,
+        "mol3d_binary": mol3d.ToBinary(),
+        "conformers": conformers,
+    }
+
+
 class FragmentDatabase:
     """SQLite-backed fragment database with geometric indexing."""
 
@@ -121,6 +173,7 @@ class FragmentDatabase:
         fragmenter: Optional[Fragmenter] = None,
         n_confs: int = 10,
         progress_callback=None,
+        workers: int = 1,
     ) -> dict:
         """Build the database from a list of (smiles, mol) pairs.
 
@@ -129,12 +182,18 @@ class FragmentDatabase:
             fragmenter: fragmentation method (default: BRICSFragmenter)
             n_confs: number of conformers per fragment
             progress_callback: optional callable(current, total)
+            workers: number of parallel workers for embedding (default: 1)
 
         Returns:
             dict with build statistics
         """
         if fragmenter is None:
             fragmenter = BRICSFragmenter()
+
+        if workers > 1:
+            return self._build_parallel(
+                molecules, fragmenter, n_confs, progress_callback, workers,
+            )
 
         stats = {"molecules": 0, "fragments": 0, "conformers": 0, "skipped": 0}
         total = len(molecules)
@@ -237,6 +296,133 @@ class FragmentDatabase:
 
         self.conn.commit()
         self._kdtree = None  # invalidate cache
+        return stats
+
+    def _build_parallel(
+        self,
+        molecules: list[tuple[str, Chem.Mol]],
+        fragmenter: Fragmenter,
+        n_confs: int,
+        progress_callback,
+        workers: int,
+    ) -> dict:
+        """Parallel build: fragment → deduplicate → embed in parallel → insert.
+
+        Phase 1: Fragment all molecules (single-threaded, fast)
+        Phase 2: Embed unique fragments in parallel (multiprocessing)
+        Phase 3: Insert results into database (single-threaded)
+        """
+        stats = {"molecules": 0, "fragments": 0, "conformers": 0, "skipped": 0}
+        total = len(molecules)
+
+        # --- Phase 1: Fragment all molecules ---
+        # unique_frags: smiles → (Fragment, [source_smiles])
+        unique_frags: dict[str, tuple[Fragment, list[str]]] = {}
+        for i, (smi, mol) in enumerate(molecules):
+            if mol is None:
+                stats["skipped"] += 1
+                continue
+            stats["molecules"] += 1
+            frags = fragmenter.fragment(mol, source_smiles=smi)
+            for frag in frags:
+                if frag.smiles in unique_frags:
+                    unique_frags[frag.smiles][1].append(smi)
+                else:
+                    unique_frags[frag.smiles] = (frag, [smi])
+
+            if progress_callback and (i + 1) % 1000 == 0:
+                progress_callback(i + 1, total, "fragmenting")
+
+        if progress_callback:
+            progress_callback(total, total, "fragmenting")
+
+        logger.info(f"Phase 1 complete: {len(unique_frags)} unique fragments from {stats['molecules']} molecules")
+
+        # --- Phase 2: Embed unique fragments in parallel ---
+        embed_tasks = []
+        for smiles, (frag, sources) in unique_frags.items():
+            mol_binary = frag.mol.ToBinary()
+            ap_dicts = [ap.to_dict() for ap in frag.attachment_points]
+            embed_tasks.append((smiles, mol_binary, ap_dicts, n_confs))
+
+        embed_results = {}
+        n_embedded = 0
+        with Pool(processes=workers) as pool:
+            for result in pool.imap_unordered(_embed_worker, embed_tasks, chunksize=32):
+                n_embedded += 1
+                if progress_callback and n_embedded % 100 == 0:
+                    progress_callback(n_embedded, len(embed_tasks), "embedding")
+                if result is not None:
+                    embed_results[result["smiles"]] = result
+
+        if progress_callback:
+            progress_callback(len(embed_tasks), len(embed_tasks), "embedding")
+
+        logger.info(f"Phase 2 complete: embedded {len(embed_results)}/{len(unique_frags)} fragments")
+
+        # --- Phase 3: Insert into database ---
+        for smiles, (frag, sources) in unique_frags.items():
+            frag_id = self._insert_fragment(frag)
+            if frag_id is None:
+                for src in sources:
+                    self._add_source(frag.smiles, src)
+                continue
+
+            stats["fragments"] += 1
+
+            # Add all sources
+            for src in sources:
+                self.conn.execute(
+                    "INSERT INTO sources (fragment_id, source_smiles) VALUES (?, ?)",
+                    (frag_id, src),
+                )
+
+            # Insert embedding results
+            embed_data = embed_results.get(smiles)
+            if embed_data is None:
+                continue
+
+            # Update mol_binary with the 3D-embedded version
+            self.conn.execute(
+                "UPDATE fragments SET mol_binary = ? WHERE id = ?",
+                (embed_data["mol3d_binary"], frag_id),
+            )
+
+            for conf_idx, energy, vectors, pairs in embed_data["conformers"]:
+                cursor = self.conn.execute(
+                    "INSERT INTO conformers (fragment_id, conformer_idx, energy) VALUES (?, ?, ?)",
+                    (frag_id, conf_idx, energy),
+                )
+                conf_id = cursor.lastrowid
+                stats["conformers"] += 1
+
+                for ap_idx, origin, direction in vectors:
+                    self.conn.execute(
+                        """INSERT INTO attachment_vectors
+                        (fragment_id, conformer_id, ap_index,
+                         origin_x, origin_y, origin_z,
+                         direction_x, direction_y, direction_z)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (frag_id, conf_id, ap_idx,
+                         origin[0], origin[1], origin[2],
+                         direction[0], direction[1], direction[2]),
+                    )
+
+                for ap1_idx, ap2_idx, dist, a1, a2, dih in pairs:
+                    self.conn.execute(
+                        """INSERT INTO vector_pairs
+                        (fragment_id, conformer_id, ap1_index, ap2_index,
+                         distance, angle1, angle2, dihedral)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (frag_id, conf_id, ap1_idx, ap2_idx,
+                         dist, a1, a2, dih),
+                    )
+
+            if stats["fragments"] % 100 == 0:
+                self.conn.commit()
+
+        self.conn.commit()
+        self._kdtree = None
         return stats
 
     def _insert_fragment(self, frag: Fragment) -> Optional[int]:

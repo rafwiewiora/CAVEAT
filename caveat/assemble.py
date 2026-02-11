@@ -15,7 +15,10 @@ from rdkit.Chem import AllChem, rdDistGeom, rdForceFieldHelpers, rdMolTransforms
 from rdkit.Geometry import Point3D
 
 from caveat.fragment import AttachmentPoint
-from caveat.geometry import align_single_vector, align_two_vectors, apply_transform
+from caveat.geometry import (
+    align_single_vector, align_two_vectors, apply_transform,
+    refine_rotation_around_axis,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,15 +225,48 @@ def _place_coordinates(
         frag_neighbor_pos = np.array(list(repl_conf.GetAtomPosition(ap.neighbor_atom_idx)))
         frag_dummy_pos = np.array(list(repl_conf.GetAtomPosition(ap.dummy_atom_idx)))
 
-        # Target side: external atom pos (where neighbor should go) and
-        # internal atom pos (direction the exit vector should point)
-        target_pos = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
-        target_dir_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+        # Target side: neighbor should land at the internal atom position
+        # (replacing it), and its exit vector should point toward the
+        # external atom (where it bonds back into the scaffold)
+        target_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+        target_dir_pos = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
 
         transform = align_single_vector(
             repl_positions, frag_neighbor_pos, frag_dummy_pos,
             target_pos, target_dir_pos,
         )
+
+        # Step 3b: Refine rotation around the bond axis using subsidiary bonds
+        # as reference. This constrains the free rotation around the exit vector.
+        aligned_tmp = apply_transform(repl_positions, transform)
+        axis = target_dir_pos - target_pos
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm > 1e-8:
+            axis = axis / axis_norm
+
+            # Fragment reference: average direction of neighbor's other bonds
+            neighbor_atom = replacement_mol.GetAtomWithIdx(ap.neighbor_atom_idx)
+            frag_other = [n.GetIdx() for n in neighbor_atom.GetNeighbors()
+                          if n.GetIdx() != ap.dummy_atom_idx and n.GetIdx() in repl_idx_to_row]
+            # Parent reference: average direction of internal atom's other bonds
+            internal_atom = parent_mol.GetAtomWithIdx(ci["internal_idx"])
+            parent_other = [n.GetIdx() for n in internal_atom.GetNeighbors()
+                            if n.GetIdx() != ci["external_idx"]]
+
+            if frag_other and parent_other:
+                aligned_neighbor = aligned_tmp[repl_idx_to_row[ap.neighbor_atom_idx]]
+                frag_ref = np.mean([aligned_tmp[repl_idx_to_row[i]] for i in frag_other], axis=0)
+                frag_ref_dir = frag_ref - aligned_neighbor
+
+                parent_int_pos = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
+                parent_ref = np.mean([np.array(list(parent_conf.GetAtomPosition(i)))
+                                      for i in parent_other], axis=0)
+                parent_ref_dir = parent_ref - parent_int_pos
+
+                refine = refine_rotation_around_axis(
+                    target_pos, axis, frag_ref_dir, parent_ref_dir,
+                )
+                transform = refine @ transform
 
     elif n_aps >= 2:
         # Build point pairs for Kabsch alignment
@@ -243,10 +279,11 @@ def _place_coordinates(
             target_ext = np.array(list(parent_conf.GetAtomPosition(ci["external_idx"])))
             target_int = np.array(list(parent_conf.GetAtomPosition(ci["internal_idx"])))
 
+            # neighbor → internal position (replaces it), dummy → external position
             source_pts.append(frag_neighbor_pos)
             source_pts.append(frag_dummy_pos)
-            target_pts.append(target_ext)
             target_pts.append(target_int)
+            target_pts.append(target_ext)
 
         transform = align_two_vectors(
             np.array(source_pts),

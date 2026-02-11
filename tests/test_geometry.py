@@ -12,6 +12,7 @@ from caveat.geometry import (
     align_single_vector,
     align_two_vectors,
     apply_transform,
+    refine_rotation_around_axis,
     _angle,
     _dihedral,
     canonicalize_dihedral,
@@ -211,6 +212,98 @@ class TestAlignSingleVector:
         expected_dir = np.array([-1.0, 0.0, 0.0])
         moved_dir /= np.linalg.norm(moved_dir)
         np.testing.assert_allclose(moved_dir, expected_dir, atol=1e-6)
+
+
+    def test_large_angle_rotation(self):
+        """Rotation > 90° must preserve distances (Rodrigues formula correctness)."""
+        frag_neighbor = np.array([0.0, 0.0, 0.0])
+        frag_dummy = np.array([1.0, 0.0, 0.0])
+        # ~140° rotation — this broke with the old K²/(1+cos) formula
+        target_pos = np.array([5.0, 5.0, 5.0])
+        target_dir = np.array([4.0, 5.1, 5.2])  # roughly opposite to exit vector
+
+        # A ring-like set of fragment positions
+        frag_positions = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.5, 0.87, 0.0],
+            [1.0, 1.73, 0.0],
+            [0.0, 1.73, 0.0],
+            [-0.5, 0.87, 0.0],
+        ])
+        transform = align_single_vector(frag_positions, frag_neighbor, frag_dummy, target_pos, target_dir)
+        result = apply_transform(frag_positions, transform)
+
+        # All pairwise distances must be preserved
+        for i in range(len(frag_positions)):
+            for j in range(i + 1, len(frag_positions)):
+                orig_dist = np.linalg.norm(frag_positions[i] - frag_positions[j])
+                new_dist = np.linalg.norm(result[i] - result[j])
+                assert abs(orig_dist - new_dist) < 0.01, (
+                    f"Distance {i}-{j}: {orig_dist:.3f} -> {new_dist:.3f}"
+                )
+
+        # Neighbor should be at target
+        np.testing.assert_allclose(result[0], target_pos, atol=1e-5)
+
+    def test_rotation_preserves_distances_all_angles(self):
+        """Verify rigid-body property across many rotation angles."""
+        frag_neighbor = np.array([0.0, 0.0, 0.0])
+        frag_dummy = np.array([1.0, 0.0, 0.0])
+        frag_positions = np.array([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        ])
+
+        for angle_deg in [30, 60, 90, 120, 150, 170]:
+            angle_rad = np.radians(angle_deg)
+            target_pos = np.array([0.0, 0.0, 0.0])
+            target_dir = np.array([np.cos(angle_rad), np.sin(angle_rad), 0.0])
+
+            transform = align_single_vector(
+                frag_positions, frag_neighbor, frag_dummy, target_pos, target_dir
+            )
+            result = apply_transform(frag_positions, transform)
+
+            orig_dist = np.linalg.norm(frag_positions[0] - frag_positions[2])
+            new_dist = np.linalg.norm(result[0] - result[2])
+            assert abs(orig_dist - new_dist) < 0.01, (
+                f"At {angle_deg}°: {orig_dist:.3f} -> {new_dist:.3f}"
+            )
+
+
+class TestRefineRotationAroundAxis:
+    def test_90_degree_refinement(self):
+        """Rotate fragment 90° around Z axis to match reference direction."""
+        anchor = np.array([0.0, 0.0, 0.0])
+        axis = np.array([0.0, 0.0, 1.0])
+        frag_ref = np.array([1.0, 0.0, 0.0])  # pointing along X
+        target_ref = np.array([0.0, 1.0, 0.0])  # pointing along Y
+
+        transform = refine_rotation_around_axis(anchor, axis, frag_ref, target_ref)
+        # Apply to a test point along X
+        result = apply_transform(np.array([[1.0, 0.0, 0.0]]), transform)
+        np.testing.assert_allclose(result[0], [0.0, 1.0, 0.0], atol=1e-6)
+
+    def test_identity_when_already_aligned(self):
+        """No rotation needed when refs already match."""
+        anchor = np.array([5.0, 5.0, 5.0])
+        axis = np.array([0.0, 0.0, 1.0])
+        ref_dir = np.array([1.0, 0.0, 0.0])
+
+        transform = refine_rotation_around_axis(anchor, axis, ref_dir, ref_dir)
+        np.testing.assert_allclose(transform, np.eye(4), atol=1e-6)
+
+    def test_preserves_points_on_axis(self):
+        """Points on the rotation axis should not move."""
+        anchor = np.array([0.0, 0.0, 0.0])
+        axis = np.array([0.0, 0.0, 1.0])
+        frag_ref = np.array([1.0, 0.0, 0.0])
+        target_ref = np.array([0.0, 1.0, 0.0])
+
+        transform = refine_rotation_around_axis(anchor, axis, frag_ref, target_ref)
+        point_on_axis = np.array([[0.0, 0.0, 5.0]])
+        result = apply_transform(point_on_axis, transform)
+        np.testing.assert_allclose(result[0], point_on_axis[0], atol=1e-6)
 
 
 class TestAlignTwoVectors:

@@ -30,7 +30,9 @@ def cli():
               help="Number of conformers per fragment")
 @click.option("--min-heavy", default=3, type=int,
               help="Minimum heavy atoms per fragment")
-def build(input_file, db_path, method, n_confs, min_heavy):
+@click.option("--workers", default=1, type=int,
+              help="Number of parallel workers for embedding (default: 1)")
+def build(input_file, db_path, method, n_confs, min_heavy, workers):
     """Build a fragment database from a SMILES file."""
     click.echo(f"Reading molecules from {input_file}...")
     molecules = _read_smiles_file(input_file)
@@ -42,16 +44,27 @@ def build(input_file, db_path, method, n_confs, min_heavy):
 
     fragmenter = BRICSFragmenter(min_heavy_atoms=min_heavy)
 
-    click.echo(f"Building database at {db_path}...")
+    if workers > 1:
+        click.echo(f"Building database at {db_path} with {workers} workers...")
+    else:
+        click.echo(f"Building database at {db_path}...")
     start = time.time()
 
     with FragmentDatabase(db_path) as db:
-        def progress(current, total):
+        last_msg = [None]
+
+        def progress(current, total, phase=None):
             if current % 10 == 0 or current == total:
-                click.echo(f"  Processed {current}/{total} molecules...")
+                if phase:
+                    msg = f"  [{phase}] {current}/{total}..."
+                else:
+                    msg = f"  Processed {current}/{total} molecules..."
+                if msg != last_msg[0]:
+                    click.echo(msg)
+                    last_msg[0] = msg
 
         stats = db.build(molecules, fragmenter=fragmenter, n_confs=n_confs,
-                        progress_callback=progress)
+                        progress_callback=progress, workers=workers)
 
     elapsed = time.time() - start
     click.echo(f"\nBuild complete in {elapsed:.1f}s:")

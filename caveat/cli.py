@@ -87,7 +87,9 @@ def build(input_file, db_path, method, n_confs, min_heavy, workers):
               help="Geometric tolerance multiplier")
 @click.option("--n-confs", default=10, type=int,
               help="Number of conformers for query molecule")
-def query(db_path, mol_smiles, query_smarts, top_k, tolerance, n_confs):
+@click.option("--output", "-o", "output_file", default=None, type=click.Path(),
+              help="Write results to CSV file instead of table")
+def query(db_path, mol_smiles, query_smarts, top_k, tolerance, n_confs, output_file):
     """Query the database for replacement fragments."""
     mol = Chem.MolFromSmiles(mol_smiles)
     if mol is None:
@@ -111,13 +113,24 @@ def query(db_path, mol_smiles, query_smarts, top_k, tolerance, n_confs):
         click.echo("No matching replacements found.")
         return
 
-    click.echo(f"\nTop {len(results)} replacement fragments:")
-    click.echo(f"{'Rank':<6}{'SMILES':<50}{'Score':<10}{'#APs':<6}{'#Heavy':<8}{'Sources':<8}")
-    click.echo("-" * 88)
-    for i, r in enumerate(results, 1):
-        nha = r.num_heavy_atoms if r.num_heavy_atoms is not None else "?"
-        sc = r.source_count if r.source_count is not None else "?"
-        click.echo(f"{i:<6}{r.smiles:<50}{r.geometric_distance:<10.3f}{r.num_attachment_points:<6}{nha:<8}{sc:<8}")
+    if output_file:
+        import csv
+        with open(output_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["rank", "smiles", "score", "num_aps", "num_heavy_atoms", "source_count"])
+            for i, r in enumerate(results, 1):
+                writer.writerow([i, r.smiles, f"{r.geometric_distance:.4f}",
+                                 r.num_attachment_points, r.num_heavy_atoms or "",
+                                 r.source_count or ""])
+        click.echo(f"Wrote {len(results)} results to {output_file}")
+    else:
+        click.echo(f"\nTop {len(results)} replacement fragments:")
+        click.echo(f"{'Rank':<6}{'SMILES':<50}{'Score':<10}{'#APs':<6}{'#Heavy':<8}{'Sources':<8}")
+        click.echo("-" * 88)
+        for i, r in enumerate(results, 1):
+            nha = r.num_heavy_atoms if r.num_heavy_atoms is not None else "?"
+            sc = r.source_count if r.source_count is not None else "?"
+            click.echo(f"{i:<6}{r.smiles:<50}{r.geometric_distance:<10.3f}{r.num_attachment_points:<6}{nha:<8}{sc:<8}")
 
 
 @cli.command()

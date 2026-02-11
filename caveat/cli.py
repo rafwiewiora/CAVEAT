@@ -35,7 +35,11 @@ def cli():
 def build(input_file, db_path, method, n_confs, min_heavy, workers):
     """Build a fragment database from a SMILES file."""
     click.echo(f"Reading molecules from {input_file}...")
-    molecules = _read_smiles_file(input_file)
+    if workers > 1:
+        # For parallel builds, just read SMILES strings — workers will parse
+        molecules = _read_smiles_file(input_file, parse=False)
+    else:
+        molecules = _read_smiles_file(input_file)
     click.echo(f"Read {len(molecules)} molecules")
 
     if not molecules:
@@ -159,8 +163,14 @@ def info(db_path):
             click.echo(f"    {nap} APs: {count} fragments")
 
 
-def _read_smiles_file(path: str) -> list[tuple[str, Chem.Mol]]:
-    """Read a SMILES file and return (smiles, mol) pairs."""
+def _read_smiles_file(path: str, parse: bool = True) -> list[tuple[str, Chem.Mol | None]]:
+    """Read a SMILES file and return (smiles, mol) pairs.
+
+    Args:
+        path: path to SMILES file
+        parse: if False, skip RDKit parsing and return (smiles, None) tuples.
+            Useful for parallel builds where workers parse their own SMILES.
+    """
     molecules = []
     with open(path) as f:
         for line in f:
@@ -169,9 +179,12 @@ def _read_smiles_file(path: str) -> list[tuple[str, Chem.Mol]]:
                 continue
             parts = line.split()
             smi = parts[0]
-            mol = Chem.MolFromSmiles(smi)
-            if mol is not None:
-                molecules.append((smi, mol))
+            if parse:
+                mol = Chem.MolFromSmiles(smi)
+                if mol is not None:
+                    molecules.append((smi, mol))
+            else:
+                molecules.append((smi, None))
     return molecules
 
 

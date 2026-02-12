@@ -9,7 +9,7 @@ import click
 from rdkit import Chem
 
 from caveat.database import FragmentDatabase
-from caveat.fragment import BRICSFragmenter
+from caveat.fragment import BRICSFragmenter, HierarchicalBRICSFragmenter
 from caveat.query import find_replacements
 
 
@@ -24,15 +24,26 @@ def cli():
               help="Input SMILES file (.smi)")
 @click.option("--db", "db_path", required=True, type=click.Path(),
               help="Output database path")
-@click.option("--method", default="brics", type=click.Choice(["brics"]),
-              help="Fragmentation method")
+@click.option("--method", default="brics", type=click.Choice(["brics", "hierarchical"]),
+              help="Fragmentation method (hierarchical = BRICS bonds, 1..max-cuts at a time)")
 @click.option("--n-confs", default=10, type=int,
               help="Number of conformers per fragment")
 @click.option("--min-heavy", default=3, type=int,
               help="Minimum heavy atoms per fragment")
+@click.option("--max-cuts", default=3, type=int,
+              help="Max simultaneous bond cuts for hierarchical mode (default: 3)")
 @click.option("--workers", default=1, type=int,
               help="Number of parallel workers for embedding (default: 1)")
-def build(input_file, db_path, method, n_confs, min_heavy, workers):
+@click.option("--max-rot-bonds", default=None, type=int,
+              help="Maximum rotatable bonds per fragment (filters after fragmentation)")
+@click.option("--min-rot-bonds", default=None, type=int,
+              help="Minimum rotatable bonds per fragment (filters after fragmentation)")
+@click.option("--fragment-only", is_flag=True, default=False,
+              help="Only fragment molecules (no 3D embedding). Use 'embed' command later.")
+@click.option("--max-heavy", "max_heavy_atoms", default=None, type=int,
+              help="Maximum heavy atoms per fragment (filters during fragmentation)")
+def build(input_file, db_path, method, n_confs, min_heavy, max_cuts, workers,
+          max_rot_bonds, min_rot_bonds, fragment_only, max_heavy_atoms):
     """Build a fragment database from a SMILES file."""
     click.echo(f"Reading molecules from {input_file}...")
     if workers > 1:
@@ -46,12 +57,23 @@ def build(input_file, db_path, method, n_confs, min_heavy, workers):
         click.echo("No valid molecules found.", err=True)
         sys.exit(1)
 
-    fragmenter = BRICSFragmenter(min_heavy_atoms=min_heavy)
-
-    if workers > 1:
-        click.echo(f"Building database at {db_path} with {workers} workers...")
+    if method == "hierarchical":
+        fragmenter = HierarchicalBRICSFragmenter(
+            min_heavy_atoms=min_heavy, max_cuts=max_cuts,
+        )
+        click.echo(f"Using hierarchical BRICS fragmentation (max {max_cuts} cuts per molecule)")
     else:
-        click.echo(f"Building database at {db_path}...")
+        fragmenter = BRICSFragmenter(min_heavy_atoms=min_heavy)
+
+    if min_rot_bonds is not None or max_rot_bonds is not None:
+        lo = min_rot_bonds if min_rot_bonds is not None else 0
+        hi = max_rot_bonds if max_rot_bonds is not None else "inf"
+        click.echo(f"Filtering fragments to {lo}-{hi} rotatable bonds")
+    mode = "Fragmenting only" if fragment_only else "Building database"
+    if workers > 1:
+        click.echo(f"{mode} at {db_path} with {workers} workers...")
+    else:
+        click.echo(f"{mode} at {db_path}...")
     start = time.time()
 
     with FragmentDatabase(db_path) as db:
@@ -67,8 +89,14 @@ def build(input_file, db_path, method, n_confs, min_heavy, workers):
                     click.echo(msg)
                     last_msg[0] = msg
 
+        if max_heavy_atoms is not None:
+            click.echo(f"Filtering fragments to ≤{max_heavy_atoms} heavy atoms")
         stats = db.build(molecules, fragmenter=fragmenter, n_confs=n_confs,
-                        progress_callback=progress, workers=workers)
+                        progress_callback=progress, workers=workers,
+                        max_rotatable_bonds=max_rot_bonds,
+                        min_rotatable_bonds=min_rot_bonds,
+                        fragment_only=fragment_only,
+                        max_heavy_atoms=max_heavy_atoms)
 
     elapsed = time.time() - start
     click.echo(f"\nBuild complete in {elapsed:.1f}s:")
@@ -76,6 +104,8 @@ def build(input_file, db_path, method, n_confs, min_heavy, workers):
     click.echo(f"  Unique fragments: {stats['fragments']}")
     click.echo(f"  Conformers generated: {stats['conformers']}")
     click.echo(f"  Skipped (invalid): {stats['skipped']}")
+    if stats.get("filtered_rot_bonds"):
+        click.echo(f"  Filtered (rotatable bonds): {stats['filtered_rot_bonds']}")
 
 
 @cli.command()

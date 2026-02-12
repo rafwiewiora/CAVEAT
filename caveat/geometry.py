@@ -40,10 +40,14 @@ class VectorPairDescriptor:
         return np.array([self.distance, self.angle1, self.angle2, self.dihedral])
 
 
-def embed_fragment(mol: Chem.Mol, n_confs: int = 10, random_seed: int = 42) -> Chem.Mol:
+def embed_fragment(mol: Chem.Mol, n_confs: int = 10, random_seed: int = 42,
+                   optimize: bool = False) -> Chem.Mol:
     """Generate 3D conformers for a fragment.
 
-    Adds hydrogens, generates conformers with ETKDGv3, and MMFF-optimizes them.
+    Adds hydrogens, generates conformers with ETKDGv3.
+    Optionally MMFF-optimizes them (off by default — ETKDGv3 geometry is
+    sufficient for computing attachment vectors, and MMFF/UFF can't
+    parameterize dummy atoms anyway).
     Returns a new mol with Hs and 3D conformers. Dummy atoms (*) are kept.
     """
     mol = Chem.RWMol(mol)
@@ -51,7 +55,7 @@ def embed_fragment(mol: Chem.Mol, n_confs: int = 10, random_seed: int = 42) -> C
 
     params = rdDistGeom.ETKDGv3()
     params.randomSeed = random_seed
-    params.numThreads = 0
+    params.numThreads = 1  # single thread per fragment; parallelism at worker level
     params.pruneRmsThresh = 0.5
 
     n_generated = AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=params)
@@ -64,15 +68,14 @@ def embed_fragment(mol: Chem.Mol, n_confs: int = 10, random_seed: int = 42) -> C
     if n_generated == 0:
         raise ValueError(f"Could not embed fragment: {Chem.MolToSmiles(mol)}")
 
-    # MMFF optimize each conformer
-    try:
-        results = rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol, numThreads=0)
-    except Exception:
-        # If MMFF fails, try UFF
+    if optimize:
         try:
-            results = rdForceFieldHelpers.UFFOptimizeMoleculeConfs(mol, numThreads=0)
+            rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol, numThreads=0)
         except Exception:
-            results = []  # keep unoptimized conformers
+            try:
+                rdForceFieldHelpers.UFFOptimizeMoleculeConfs(mol, numThreads=0)
+            except Exception:
+                pass  # keep unoptimized conformers
 
     return mol
 

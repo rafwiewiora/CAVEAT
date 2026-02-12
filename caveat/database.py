@@ -18,7 +18,7 @@ from typing import Optional
 import numpy as np
 from rdkit import Chem
 
-from caveat.fragment import Fragment, AttachmentPoint, BRICSFragmenter, Fragmenter
+from caveat.fragment import Fragment, AttachmentPoint, BRICSFragmenter, HierarchicalBRICSFragmenter, Fragmenter
 from caveat.geometry import (
     embed_fragment,
     compute_vector_pair_descriptor,
@@ -91,13 +91,22 @@ ON vector_pairs(fragment_id);
 
 
 def _fragment_worker(args):
-    """Worker for parallel BRICS fragmentation.
+    """Worker for parallel fragmentation.
 
     Accepts a batch of SMILES strings, parses, fragments, and deduplicates
     locally within the chunk. Returns a dict of unique fragments.
     """
-    smiles_batch, min_heavy_atoms = args
-    fragmenter = BRICSFragmenter(min_heavy_atoms=min_heavy_atoms)
+    if len(args) == 5:
+        smiles_batch, min_heavy_atoms, fragmenter_type, max_cuts, max_heavy_atoms = args
+    else:
+        smiles_batch, min_heavy_atoms, fragmenter_type, max_cuts = args
+        max_heavy_atoms = None
+    if fragmenter_type == "hierarchical":
+        fragmenter = HierarchicalBRICSFragmenter(
+            min_heavy_atoms=min_heavy_atoms, max_cuts=max_cuts,
+        )
+    else:
+        fragmenter = BRICSFragmenter(min_heavy_atoms=min_heavy_atoms)
 
     # Local dedup within this chunk
     unique = {}  # smiles → (mol_binary, ap_dicts, labels, nha, nap, [sources])
@@ -108,6 +117,8 @@ def _fragment_worker(args):
             continue
         frags = fragmenter.fragment(mol, source_smiles=smi)
         for frag in frags:
+            if max_heavy_atoms is not None and frag.num_heavy_atoms > max_heavy_atoms:
+                continue
             if frag.smiles in unique:
                 unique[frag.smiles][-1].append(smi)
             else:
@@ -133,13 +144,13 @@ def _embed_worker(args):
     try:
         mol3d = embed_fragment(mol, n_confs=n_confs)
     except Exception:
-        return None
+        return {"smiles": smiles, "mol3d_binary": None, "conformers": []}
 
     aps = _find_attachment_points_in_mol(mol3d)
     conformers = []
     for conf_idx in range(mol3d.GetNumConformers()):
         conf = mol3d.GetConformer(conf_idx)
-        energy = _get_conformer_energy(mol3d, conf_idx)
+        energy = None
 
         vectors = []
         for ap_idx, ap in enumerate(aps):
@@ -206,6 +217,10 @@ class FragmentDatabase:
         n_confs: int = 10,
         progress_callback=None,
         workers: int = 1,
+        max_rotatable_bonds: Optional[int] = None,
+        min_rotatable_bonds: Optional[int] = None,
+        fragment_only: bool = False,
+        max_heavy_atoms: Optional[int] = None,
     ) -> dict:
         """Build the database from a list of (smiles, mol) pairs.
 
@@ -215,6 +230,10 @@ class FragmentDatabase:
             n_confs: number of conformers per fragment
             progress_callback: optional callable(current, total)
             workers: number of parallel workers for embedding (default: 1)
+            max_rotatable_bonds: if set, skip fragments with more rotatable bonds
+            min_rotatable_bonds: if set, skip fragments with fewer rotatable bonds
+            fragment_only: if True, only fragment and insert metadata (no 3D embedding)
+            max_heavy_atoms: if set, skip fragments with more heavy atoms (filtered during fragmentation)
 
         Returns:
             dict with build statistics
@@ -225,6 +244,10 @@ class FragmentDatabase:
         if workers > 1:
             return self._build_parallel(
                 molecules, fragmenter, n_confs, progress_callback, workers,
+                max_rotatable_bonds=max_rotatable_bonds,
+                min_rotatable_bonds=min_rotatable_bonds,
+                fragment_only=fragment_only,
+                max_heavy_atoms=max_heavy_atoms,
             )
 
         stats = {"molecules": 0, "fragments": 0, "conformers": 0, "skipped": 0}
@@ -239,6 +262,8 @@ class FragmentDatabase:
             frags = fragmenter.fragment(mol, source_smiles=smi)
 
             for frag in frags:
+                if max_heavy_atoms is not None and frag.num_heavy_atoms > max_heavy_atoms:
+                    continue
                 frag_id = self._insert_fragment(frag)
                 if frag_id is None:
                     # Already exists — increment source count and add source
@@ -253,6 +278,9 @@ class FragmentDatabase:
                     (frag_id, smi),
                 )
 
+                if fragment_only:
+                    continue
+
                 # Embed in 3D and compute geometry
                 try:
                     mol3d = embed_fragment(frag.mol, n_confs=n_confs)
@@ -265,7 +293,7 @@ class FragmentDatabase:
 
                 for conf_idx in range(mol3d.GetNumConformers()):
                     conf = mol3d.GetConformer(conf_idx)
-                    energy = _get_conformer_energy(mol3d, conf_idx)
+                    energy = None
 
                     cursor = self.conn.execute(
                         "INSERT INTO conformers (fragment_id, conformer_idx, energy) VALUES (?, ?, ?)",
@@ -337,12 +365,17 @@ class FragmentDatabase:
         n_confs: int,
         progress_callback,
         workers: int,
+        max_rotatable_bonds: Optional[int] = None,
+        min_rotatable_bonds: Optional[int] = None,
+        fragment_only: bool = False,
+        max_heavy_atoms: Optional[int] = None,
     ) -> dict:
-        """Fully parallel build: fragment in parallel → embed in parallel → insert.
+        """Streaming parallel build: fragment → embed+insert in batches.
 
-        Phase 1: Fragment molecules in parallel (multiprocessing)
-        Phase 2: Embed unique fragments in parallel (multiprocessing)
-        Phase 3: Insert results into database (single-threaded, fast)
+        Phase 1: Fragment molecules in parallel (multiprocessing).
+                 Stores source counts (not full lists) to save memory.
+        Phase 2: Embed fragments in parallel and insert into DB as results
+                 arrive. Frees each fragment from memory after insertion.
         """
         stats = {"molecules": 0, "fragments": 0, "conformers": 0, "skipped": 0}
 
@@ -352,28 +385,83 @@ class FragmentDatabase:
         stats["molecules"] = len(smiles_list)
 
         min_heavy = getattr(fragmenter, "min_heavy_atoms", 3)
+        max_cuts = getattr(fragmenter, "max_cuts", 3)
+        frag_type = "hierarchical" if isinstance(fragmenter, HierarchicalBRICSFragmenter) else "brics"
 
         # --- Phase 1: Parallel fragmentation ---
-        chunk_size = max(1000, len(smiles_list) // workers)
+        # Hierarchical fragmentation is much heavier per molecule, use smaller chunks
+        if frag_type == "hierarchical":
+            chunk_size = 5000
+        else:
+            chunk_size = max(1000, len(smiles_list) // workers)
         chunks = [smiles_list[i:i + chunk_size]
                   for i in range(0, len(smiles_list), chunk_size)]
 
         if progress_callback:
             progress_callback(0, len(smiles_list), "fragmenting")
 
-        # unique_frags: smiles → [mol_binary, ap_dicts, labels, nha, nap, [sources]]
+        # Fragment-only mode: stream inserts per chunk (no memory accumulation)
+        if fragment_only:
+            chunks_done = 0
+            with Pool(processes=workers) as pool:
+                for chunk_result in pool.imap_unordered(
+                    _fragment_worker,
+                    [(chunk, min_heavy, frag_type, max_cuts, max_heavy_atoms) for chunk in chunks],
+                ):
+                    for smiles, data in chunk_result.items():
+                        mol_binary = data[0]
+                        ap_dicts = data[1]
+                        labels = data[2]
+                        nha = data[3]
+                        nap = data[4]
+                        source_count = len(data[5])
+                        labels_json = json.dumps(labels)
+                        ap_json = json.dumps(ap_dicts)
+                        try:
+                            self.conn.execute(
+                                """INSERT INTO fragments
+                                (canonical_smiles, mol_binary, num_heavy_atoms,
+                                 num_attachment_points, brics_labels,
+                                 attachment_points_json, source_count)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (smiles, mol_binary, nha, nap,
+                                 labels_json, ap_json, source_count),
+                            )
+                            stats["fragments"] += 1
+                        except sqlite3.IntegrityError:
+                            # Already exists — increment source count
+                            self.conn.execute(
+                                "UPDATE fragments SET source_count = source_count + ? "
+                                "WHERE canonical_smiles = ?",
+                                (source_count, smiles),
+                            )
+                    self.conn.commit()
+                    chunks_done += 1
+                    if progress_callback:
+                        done_mols = sum(len(chunks[i]) for i in range(chunks_done))
+                        progress_callback(
+                            min(done_mols, len(smiles_list)),
+                            len(smiles_list), "fragmenting",
+                        )
+            if progress_callback:
+                progress_callback(len(smiles_list), len(smiles_list), "fragmenting")
+            return stats
+
+        # Normal mode: accumulate in memory, then embed
+        # unique_frags: smiles → [mol_binary, ap_dicts, labels, nha, nap, source_count]
+        # Store counts instead of full source lists to save memory on large builds.
         unique_frags = {}
         chunks_done = 0
         with Pool(processes=workers) as pool:
             for chunk_result in pool.imap_unordered(
                 _fragment_worker,
-                [(chunk, min_heavy) for chunk in chunks],
+                [(chunk, min_heavy, frag_type, max_cuts, max_heavy_atoms) for chunk in chunks],
             ):
                 for smiles, data in chunk_result.items():
                     if smiles in unique_frags:
-                        unique_frags[smiles][-1].extend(data[-1])
+                        unique_frags[smiles][-1] += len(data[-1])
                     else:
-                        unique_frags[smiles] = data
+                        unique_frags[smiles] = data[:-1] + [len(data[-1])]
                 chunks_done += 1
                 if progress_callback:
                     done_mols = sum(len(chunks[i]) for i in range(chunks_done))
@@ -390,109 +478,129 @@ class FragmentDatabase:
             f"from {stats['molecules']} molecules"
         )
 
-        # --- Phase 2: Parallel embedding ---
+        # Filter by rotatable bonds if requested
+        if max_rotatable_bonds is not None or min_rotatable_bonds is not None:
+            from rdkit.Chem.Descriptors import NumRotatableBonds
+            lo = min_rotatable_bonds if min_rotatable_bonds is not None else 0
+            hi = max_rotatable_bonds if max_rotatable_bonds is not None else float("inf")
+            before = len(unique_frags)
+            to_remove = []
+            for smiles, data in unique_frags.items():
+                mol = Chem.Mol(data[0])  # mol_binary
+                rb = NumRotatableBonds(mol)
+                if rb < lo or rb > hi:
+                    to_remove.append(smiles)
+            for smi in to_remove:
+                del unique_frags[smi]
+            stats["filtered_rot_bonds"] = before - len(unique_frags)
+            logger.info(
+                f"Rotatable bond filter ({lo}-{hi}): "
+                f"kept {len(unique_frags)}/{before} fragments"
+            )
+
+        # --- Phase 2: Embed in parallel + stream inserts to DB ---
+        # Skip fragments already in the DB (resume support)
+        existing = set(
+            row[0] for row in self.conn.execute(
+                "SELECT canonical_smiles FROM fragments"
+            ).fetchall()
+        )
+        if existing:
+            for smi in existing:
+                unique_frags.pop(smi, None)
+            logger.info(
+                f"Resuming: skipping {len(existing)} fragments already in DB, "
+                f"{len(unique_frags)} remaining"
+            )
+
         embed_tasks = []
         for smiles, data in unique_frags.items():
             mol_binary, ap_dicts = data[0], data[1]
             embed_tasks.append((smiles, mol_binary, ap_dicts, n_confs))
 
-        embed_results = {}
-        n_embedded = 0
+        n_total = len(embed_tasks)
+        n_done = 0
+
+        if progress_callback:
+            progress_callback(0, n_total, "embedding+inserting")
+
         with Pool(processes=workers) as pool:
             for result in pool.imap_unordered(
                 _embed_worker, embed_tasks, chunksize=32,
             ):
-                n_embedded += 1
-                if progress_callback and n_embedded % 500 == 0:
-                    progress_callback(n_embedded, len(embed_tasks), "embedding")
-                if result is not None:
-                    embed_results[result["smiles"]] = result
+                n_done += 1
+                smiles = result["smiles"]
 
-        if progress_callback:
-            progress_callback(len(embed_tasks), len(embed_tasks), "embedding")
+                # Look up fragment metadata and remove from dict to free memory
+                data = unique_frags.pop(smiles, None)
+                if data is None:
+                    continue
 
-        logger.info(
-            f"Phase 2 complete: embedded {len(embed_results)}/{len(unique_frags)} fragments"
-        )
+                mol_binary, ap_dicts, labels, nha, nap, source_count = data
+                labels_json = json.dumps(labels)
+                ap_json = json.dumps(ap_dicts)
 
-        # --- Phase 3: Insert into database (serial, fast) ---
-        n_inserted = 0
-        for smiles, data in unique_frags.items():
-            mol_binary, ap_dicts, labels, nha, nap, sources = data
-            labels_json = json.dumps(labels)
-            ap_json = json.dumps(ap_dicts)
+                # Use 3D mol binary if embedding succeeded, else keep 2D
+                db_mol_binary = result["mol3d_binary"] or mol_binary
 
-            try:
-                cursor = self.conn.execute(
-                    """INSERT INTO fragments
-                    (canonical_smiles, num_heavy_atoms, num_attachment_points,
-                     brics_labels, attachment_points_json, source_count)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (smiles, nha, nap, labels_json, ap_json, len(sources)),
-                )
-                frag_id = cursor.lastrowid
-            except sqlite3.IntegrityError:
-                continue
-
-            stats["fragments"] += 1
-
-            for src in sources:
-                self.conn.execute(
-                    "INSERT INTO sources (fragment_id, source_smiles) VALUES (?, ?)",
-                    (frag_id, src),
-                )
-
-            embed_data = embed_results.get(smiles)
-            if embed_data is None:
-                continue
-
-            self.conn.execute(
-                "UPDATE fragments SET mol_binary = ? WHERE id = ?",
-                (embed_data["mol3d_binary"], frag_id),
-            )
-
-            for conf_idx, energy, vectors, pairs in embed_data["conformers"]:
-                cursor = self.conn.execute(
-                    "INSERT INTO conformers (fragment_id, conformer_idx, energy) "
-                    "VALUES (?, ?, ?)",
-                    (frag_id, conf_idx, energy),
-                )
-                conf_id = cursor.lastrowid
-                stats["conformers"] += 1
-
-                for ap_idx, origin, direction in vectors:
-                    self.conn.execute(
-                        """INSERT INTO attachment_vectors
-                        (fragment_id, conformer_id, ap_index,
-                         origin_x, origin_y, origin_z,
-                         direction_x, direction_y, direction_z)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (frag_id, conf_id, ap_idx,
-                         origin[0], origin[1], origin[2],
-                         direction[0], direction[1], direction[2]),
+                try:
+                    cursor = self.conn.execute(
+                        """INSERT INTO fragments
+                        (canonical_smiles, mol_binary, num_heavy_atoms,
+                         num_attachment_points, brics_labels,
+                         attachment_points_json, source_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (smiles, db_mol_binary, nha, nap,
+                         labels_json, ap_json, source_count),
                     )
+                    frag_id = cursor.lastrowid
+                except sqlite3.IntegrityError:
+                    continue
 
-                for ap1_idx, ap2_idx, dist, a1, a2, dih in pairs:
-                    self.conn.execute(
-                        """INSERT INTO vector_pairs
-                        (fragment_id, conformer_id, ap1_index, ap2_index,
-                         distance, angle1, angle2, dihedral)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (frag_id, conf_id, ap1_idx, ap2_idx,
-                         dist, a1, a2, dih),
+                stats["fragments"] += 1
+
+                # Insert conformers, vectors, and pairs
+                for conf_idx, energy, vectors, pairs in result["conformers"]:
+                    cursor = self.conn.execute(
+                        "INSERT INTO conformers (fragment_id, conformer_idx, energy) "
+                        "VALUES (?, ?, ?)",
+                        (frag_id, conf_idx, energy),
                     )
+                    conf_id = cursor.lastrowid
+                    stats["conformers"] += 1
 
-            n_inserted += 1
-            if n_inserted % 1000 == 0:
-                self.conn.commit()
-                if progress_callback:
-                    progress_callback(n_inserted, len(unique_frags), "inserting")
+                    for ap_idx, origin, direction in vectors:
+                        self.conn.execute(
+                            """INSERT INTO attachment_vectors
+                            (fragment_id, conformer_id, ap_index,
+                             origin_x, origin_y, origin_z,
+                             direction_x, direction_y, direction_z)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (frag_id, conf_id, ap_idx,
+                             origin[0], origin[1], origin[2],
+                             direction[0], direction[1], direction[2]),
+                        )
+
+                    for ap1_idx, ap2_idx, dist, a1, a2, dih in pairs:
+                        self.conn.execute(
+                            """INSERT INTO vector_pairs
+                            (fragment_id, conformer_id, ap1_index, ap2_index,
+                             distance, angle1, angle2, dihedral)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (frag_id, conf_id, ap1_idx, ap2_idx,
+                             dist, a1, a2, dih),
+                        )
+
+                if n_done % 100 == 0:
+                    self.conn.commit()
+                    if progress_callback:
+                        progress_callback(n_done, n_total, "embedding+inserting")
 
         self.conn.commit()
         self._kdtree = None
 
         if progress_callback:
-            progress_callback(len(unique_frags), len(unique_frags), "inserting")
+            progress_callback(n_total, n_total, "embedding+inserting")
 
         return stats
 
@@ -500,13 +608,14 @@ class FragmentDatabase:
         """Insert a fragment, return its ID, or None if already exists."""
         ap_json = json.dumps([ap.to_dict() for ap in frag.attachment_points])
         labels_json = json.dumps(frag.brics_labels)
+        mol_binary = frag.mol.ToBinary() if frag.mol is not None else None
         try:
             cursor = self.conn.execute(
                 """INSERT INTO fragments
-                (canonical_smiles, num_heavy_atoms, num_attachment_points,
+                (canonical_smiles, mol_binary, num_heavy_atoms, num_attachment_points,
                  brics_labels, attachment_points_json, source_count)
-                VALUES (?, ?, ?, ?, ?, 1)""",
-                (frag.smiles, frag.num_heavy_atoms, frag.num_attachment_points,
+                VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                (frag.smiles, mol_binary, frag.num_heavy_atoms, frag.num_attachment_points,
                  labels_json, ap_json),
             )
             return cursor.lastrowid

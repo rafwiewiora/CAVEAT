@@ -25,3 +25,20 @@ Thumbs.db
 .env
 *.db
 !data/*.db
+
+# Large data files
+data/chembl_35_chemreps.txt.gz
+data/chembl_approved_drugs.smi
+data/chembl_druglike.smi
+*.db-shm
+*.db-wal
+
+# Results / test compound data (private)
+results_*/
+archived_results/
+test_sanity_*/
+test_sanity_*.sdf
+
+# Generated viewers / sessions
+*.pml
+drug_info.json

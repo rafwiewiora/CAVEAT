@@ -7,6 +7,7 @@ fragments from the database ranked by geometric similarity.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -53,20 +54,24 @@ def find_replacements(
     n_confs: int = 10,
     top_k: int = 20,
     tolerance: float = 1.0,
-    use_kdtree: bool = True,
+    use_kdtree: bool = False,
     mol_smiles: Optional[str] = None,
+    mol_3d: Optional[Chem.Mol] = None,
 ) -> list[ReplacementResult]:
     """Find replacement fragments for a substructure in a molecule.
 
     Args:
-        mol: the query molecule
+        mol: the query molecule (used for substructure matching)
         query_smarts: SMARTS pattern identifying the substructure to replace
         db: the fragment database
         n_confs: number of conformers for the query molecule
         top_k: maximum number of results to return
-        tolerance: geometric tolerance multiplier (1.0 = default tolerances)
-        use_kdtree: use KDTree for fast search (True) or SQL range query (False)
+        tolerance: geometric tolerance multiplier (1.0 = default tolerances:
+                   distance ±0.5Å, angles ±15°, dihedral ±30°)
+        use_kdtree: use KDTree for fast ranked search (no hard cutoff) or
+                    SQL range query with hard tolerance cutoffs (default)
         mol_smiles: optional SMILES for the query molecule
+        mol_3d: optional pre-embedded 3D molecule (skips conformer generation)
 
     Returns:
         list of ReplacementResult, sorted by geometric_distance
@@ -93,21 +98,26 @@ def find_replacements(
     num_aps = len(cut_bonds)
     logger.info(f"Found {num_aps} cut bond(s) for replacement")
 
-    # Step 3: Embed the query molecule in 3D
-    mol3d = Chem.AddHs(mol)
-    params = rdDistGeom.ETKDGv3()
-    params.randomSeed = 42
-    n_gen = AllChem.EmbedMultipleConfs(mol3d, numConfs=n_confs, params=params)
-    if n_gen == 0:
-        params.useRandomCoords = True
+    # Step 3: Get 3D molecule — use pre-embedded or generate conformers
+    if mol_3d is not None:
+        mol3d = mol_3d
+        if mol3d.GetNumConformers() == 0:
+            raise ValueError("Provided mol_3d has no conformers")
+    else:
+        mol3d = Chem.AddHs(mol)
+        params = rdDistGeom.ETKDGv3()
+        params.randomSeed = 42
         n_gen = AllChem.EmbedMultipleConfs(mol3d, numConfs=n_confs, params=params)
-    if n_gen == 0:
-        raise ValueError("Could not generate 3D conformers for query molecule")
+        if n_gen == 0:
+            params.useRandomCoords = True
+            n_gen = AllChem.EmbedMultipleConfs(mol3d, numConfs=n_confs, params=params)
+        if n_gen == 0:
+            raise ValueError("Could not generate 3D conformers for query molecule")
 
-    try:
-        rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol3d, numThreads=0)
-    except Exception:
-        pass
+        try:
+            rdForceFieldHelpers.MMFFOptimizeMoleculeConfs(mol3d, numThreads=0)
+        except Exception:
+            pass
 
     # Step 4: Compute exit vector geometry at cut points
     # We need to map the original atom indices to the Hs-added mol
@@ -207,9 +217,45 @@ def find_replacements(
                         source_count=frag_info["source_count"] if frag_info else None,
                     )
 
-    # Step 6: Sort by geometric distance and return top-k
+    # Step 6: Sort by geometric distance, deduplicate by core SMILES, return top-k
     results = sorted(all_results.values(), key=lambda r: r.geometric_distance)
+    results = _deduplicate_by_core(results)
     return results[:top_k]
+
+
+def _strip_brics_labels(smiles: str) -> str:
+    """Strip BRICS isotope labels from dummy atoms to get a core SMILES.
+
+    Converts e.g. '[5*]c1ccc([12*])cc1' → '*c1ccc(*)cc1' and re-canonicalizes.
+    """
+    stripped = re.sub(r'\[\d+\*\]', '[*]', smiles)
+    mol = Chem.MolFromSmiles(stripped)
+    if mol is not None:
+        return Chem.MolToSmiles(mol)
+    return stripped
+
+
+def _deduplicate_by_core(results: list[ReplacementResult]) -> list[ReplacementResult]:
+    """Remove results that are the same core scaffold differing only in BRICS labels.
+
+    Keeps the best-scoring (lowest geometric_distance) entry per core SMILES.
+    Input must already be sorted by geometric_distance.
+    """
+    seen_cores: dict[str, int] = {}
+    deduped = []
+    for r in results:
+        core = _strip_brics_labels(r.smiles)
+        if core not in seen_cores:
+            seen_cores[core] = r.fragment_id
+            deduped.append(r)
+        else:
+            logger.debug(
+                f"Dedup: fragment {r.fragment_id} ({r.smiles}) is a label variant "
+                f"of fragment {seen_cores[core]} (core: {core})"
+            )
+    if len(results) != len(deduped):
+        logger.info(f"Deduplicated {len(results)} → {len(deduped)} results (removed {len(results) - len(deduped)} label variants)")
+    return deduped
 
 
 def _find_cut_bonds(mol: Chem.Mol, match_atoms: set[int]) -> list[CutBond]:

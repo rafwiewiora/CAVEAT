@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Optional
 
 from rdkit import Chem
@@ -157,5 +158,96 @@ class BRICSFragmenter(Fragmenter):
                 source_smiles=source_smiles,
                 brics_labels=brics_labels_list,
             ))
+
+        return fragments
+
+
+class HierarchicalBRICSFragmenter(Fragmenter):
+    """Hierarchical BRICS fragmentation — cut 1..max_cuts bonds at a time.
+
+    Instead of cutting all BRICS bonds simultaneously (producing tiny fragments),
+    enumerates all combinations of 1, 2, ... max_cuts bonds. This produces
+    fragments at all size scales, from large (1 cut → 2 big pieces) to small.
+
+    For CAVEAT 2-AP queries, the 2-bond cuts produce natural linker+ring
+    fragments that the all-at-once approach misses entirely.
+    """
+
+    def __init__(self, min_heavy_atoms: int = 3, max_cuts: int = 3):
+        self.min_heavy_atoms = min_heavy_atoms
+        self.max_cuts = max_cuts
+
+    def fragment(self, mol: Chem.Mol, source_smiles: str = "") -> list[Fragment]:
+        if mol is None:
+            return []
+
+        if not source_smiles:
+            source_smiles = Chem.MolToSmiles(mol)
+
+        # Find BRICS bonds
+        brics_bonds = list(BRICS.FindBRICSBonds(mol))
+        if not brics_bonds:
+            return []
+
+        # Build list of (bond_idx, (label_i, label_j)) for each BRICS bond
+        bond_info = []  # [(bond_idx, (label_i, label_j)), ...]
+        for (i, j), (label_i, label_j) in brics_bonds:
+            bond = mol.GetBondBetweenAtoms(i, j)
+            if bond is None:
+                continue
+            bond_info.append((bond.GetIdx(), (int(label_i), int(label_j))))
+
+        if not bond_info:
+            return []
+
+        # Enumerate all combinations of 1..max_cuts bonds
+        seen_smiles = set()
+        fragments = []
+        max_k = min(self.max_cuts, len(bond_info))
+
+        for k in range(1, max_k + 1):
+            for combo in combinations(range(len(bond_info)), k):
+                bond_indices = [bond_info[c][0] for c in combo]
+                dummy_labels = [bond_info[c][1] for c in combo]
+
+                frag_mol = Chem.FragmentOnBonds(
+                    mol, bond_indices, dummyLabels=dummy_labels,
+                )
+
+                frag_mols = Chem.GetMolFrags(
+                    frag_mol, asMols=True, sanitizeFrags=True,
+                )
+
+                for fmol in frag_mols:
+                    smiles = Chem.MolToSmiles(fmol)
+                    if smiles in seen_smiles:
+                        continue
+                    seen_smiles.add(smiles)
+
+                    aps = []
+                    for atom in fmol.GetAtoms():
+                        if atom.GetAtomicNum() == 0:
+                            isotope = atom.GetIsotope()
+                            neighbors = atom.GetNeighbors()
+                            if neighbors:
+                                aps.append(AttachmentPoint(
+                                    dummy_atom_idx=atom.GetIdx(),
+                                    neighbor_atom_idx=neighbors[0].GetIdx(),
+                                    brics_label=isotope,
+                                    bond_order=1,
+                                ))
+
+                    n_heavy = sum(1 for a in fmol.GetAtoms() if a.GetAtomicNum() > 0)
+                    if n_heavy < self.min_heavy_atoms:
+                        continue
+
+                    brics_labels_list = sorted(set(ap.brics_label for ap in aps))
+                    fragments.append(Fragment(
+                        mol=fmol,
+                        smiles=smiles,
+                        attachment_points=aps,
+                        source_smiles=source_smiles,
+                        brics_labels=brics_labels_list,
+                    ))
 
         return fragments

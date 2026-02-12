@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Build a screening DB from a filtered subset of chembl_full_frags.db.
+"""Build a screening DB from hierarchical fragments DB.
 
-Extracts fragments matching: HA<=14, 2 APs, 0 aromatic rings, <=1 rotatable bonds.
+Extracts fragments matching: HA<=14, 1-2 APs, <=1 aromatic ring, <=2 rotatable bonds.
 Embeds them with 5 3D conformers and computes geometric descriptors.
 Uses multiprocessing for embedding.
 """
@@ -21,10 +21,11 @@ from caveat.database import _find_attachment_points_in_mol, SCHEMA
 
 RDLogger.DisableLog('rdApp.*')
 
-SRC_DB = '/Users/rafal/repos/CAVEAT/chembl_full_frags.db'
-DST_DB = '/Users/rafal/repos/CAVEAT/chembl_screen_rot1_5conf.db'
+SRC_DB = '/Users/rafal/repos/CAVEAT/chembl_hier_frags.db'
+DST_DB = '/Users/rafal/repos/CAVEAT/chembl_hier_screen_v2.db'
 NUM_WORKERS = 14
 BATCH_SIZE = 100
+N_CONFS = 5
 
 
 def _embed_worker(batch):
@@ -35,7 +36,7 @@ def _embed_worker(batch):
         if mol is None:
             continue
         try:
-            mol3d = embed_fragment(mol, n_confs=5)
+            mol3d = embed_fragment(mol, n_confs=N_CONFS)
         except Exception:
             continue
         results.append((smi, mol3d.ToBinary(), nha, nap, labels, sc))
@@ -44,7 +45,7 @@ def _embed_worker(batch):
 
 def main():
     # Read source fragments
-    print('Reading source fragments...')
+    print('Reading source fragments from hierarchical DB...')
     t0 = time.time()
     src = sqlite3.connect(SRC_DB)
     rows = src.execute('''
@@ -52,9 +53,9 @@ def main():
                brics_labels, source_count
         FROM fragments
         WHERE num_heavy_atoms <= 14
-          AND num_attachment_points = 2
-          AND num_aromatic_rings = 0
-          AND num_rotatable_bonds <= 1
+          AND num_attachment_points IN (1, 2)
+          AND num_aromatic_rings <= 1
+          AND num_rotatable_bonds <= 2
     ''').fetchall()
     src.close()
     print(f'Read {len(rows):,} fragments in {time.time()-t0:.0f}s')
@@ -70,7 +71,8 @@ def main():
 
     # Split into batches for multiprocessing
     batches = [rows[i:i+BATCH_SIZE] for i in range(0, len(rows), BATCH_SIZE)]
-    print(f'Embedding with {NUM_WORKERS} workers, {len(batches)} batches...')
+    print(f'Embedding {len(rows):,} fragments with {NUM_WORKERS} workers, '
+          f'{len(batches)} batches, {N_CONFS} confs each...')
 
     pool = mp.Pool(NUM_WORKERS)
     embedded = 0

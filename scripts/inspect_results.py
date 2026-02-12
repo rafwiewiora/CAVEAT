@@ -45,7 +45,7 @@ from rdkit.Geometry import Point3D
 from caveat.database import FragmentDatabase, _find_attachment_points_in_mol
 from caveat.fragment import AttachmentPoint
 from caveat.query import find_replacements, _find_cut_bonds, ReplacementResult, _strip_brics_labels, _deduplicate_by_core
-from caveat.assemble import assemble
+from caveat.assemble import assemble, compute_planarity_score
 from caveat.geometry import (
     align_single_vector, align_two_vectors, apply_transform,
     compute_vector_pair_descriptor,
@@ -641,6 +641,9 @@ def main():
             continue
 
         props = compute_properties(assembled)
+        planarity = compute_planarity_score(assembled, parent_3d, match_atoms_3d)
+        props["MaxOOP"] = round(planarity["max_oop"], 3) if planarity["max_oop"] is not None else None
+        props["MeanOOP"] = round(planarity["mean_oop"], 3) if planarity["mean_oop"] is not None else None
         passed = passes_filters(props, filters) and passes_delta_filters(props, parent_props, delta_filters)
         all_products.append((i, result, assembled, frag_info, props, passed))
 
@@ -743,7 +746,7 @@ def main():
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        header = ["rank", "fragment_smiles", "assembled_smiles", "geo_score", "passed"] + prop_keys + delta_keys
+        header = ["rank", "fragment_smiles", "assembled_smiles", "geo_score", "max_oop", "mean_oop", "passed"] + prop_keys + delta_keys
         writer.writerow(header)
 
         # Write parent as row 0
@@ -756,7 +759,9 @@ def main():
         for rank_in, result, assembled, frag_info, props, passed in all_products:
             assembled_smi = Chem.MolToSmiles(assembled)
             row = [rank_in, result.smiles, assembled_smi,
-                   f"{result.geometric_distance:.4f}", "PASS" if passed else "FAIL"]
+                   f"{result.geometric_distance:.4f}",
+                   props.get("MaxOOP", ""), props.get("MeanOOP", ""),
+                   "PASS" if passed else "FAIL"]
             row += [props[k] for k in prop_keys]
             row += [round(props[k] - parent_props[k], 2) for k in prop_keys[:-1]]
             writer.writerow(row)
@@ -785,12 +790,12 @@ def main():
                   f"{d['MW']:+<8.1f}{d['cLogP']:+<8.2f}{d['HBA']:+<6d}{d['HBD']:+<6d}"
                   f"{d['RotBonds']:+<7d}{d['TPSA']:+<8.1f}{d['ArRings']:+<6d}{d['SatRings']:+<7d}{smi}")
     else:
-        hdr = f"{'#':<4}{'Pass':<6}{'Score':<8}{'MW':<8}{'cLogP':<8}{'HBA':<5}{'HBD':<5}{'RotB':<6}{'TPSA':<8}{'ArR':<5}{'SatR':<6}{'Fragment SMILES'}"
+        hdr = f"{'#':<4}{'Pass':<6}{'Score':<8}{'OOP':<6}{'MW':<8}{'cLogP':<8}{'HBA':<5}{'HBD':<5}{'RotB':<6}{'TPSA':<8}{'ArR':<5}{'SatR':<6}{'Fragment SMILES'}"
         print(hdr)
         print("-" * len(hdr))
 
         pp = parent_props
-        print(f"{'P':<4}{'---':<6}{'':<8}{pp['MW']:<8}{pp['cLogP']:<8}{pp['HBA']:<5}{pp['HBD']:<5}"
+        print(f"{'P':<4}{'---':<6}{'':<8}{'':<6}{pp['MW']:<8}{pp['cLogP']:<8}{pp['HBA']:<5}{pp['HBD']:<5}"
               f"{pp['RotBonds']:<6}{pp['TPSA']:<8}{pp['ArRings']:<5}{pp['SatRings']:<6}(parent)")
 
         for rank_in, result, assembled, frag_info, props, passed in all_products:
@@ -798,8 +803,10 @@ def main():
             smi = result.smiles
             if len(smi) > 45:
                 smi = smi[:42] + "..."
+            oop = props.get('MaxOOP')
+            oop_str = f"{oop:.2f}" if oop is not None else "?"
             print(f"{rank_in:<4}{flag:<6}{result.geometric_distance:<8.3f}"
-                  f"{props['MW']:<8}{props['cLogP']:<8}{props['HBA']:<5}{props['HBD']:<5}"
+                  f"{oop_str:<6}{props['MW']:<8}{props['cLogP']:<8}{props['HBA']:<5}{props['HBD']:<5}"
                   f"{props['RotBonds']:<6}{props['TPSA']:<8}{props['ArRings']:<5}{props['SatRings']:<6}{smi}")
 
     db.close()

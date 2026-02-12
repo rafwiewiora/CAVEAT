@@ -428,3 +428,120 @@ def _embed_assembled(
 
     result_mol = Chem.RemoveHs(result_mol)
     return result_mol
+
+
+def compute_planarity_score(
+    assembled_mol: Chem.Mol,
+    parent_mol: Chem.Mol,
+    match_atoms: tuple[int, ...],
+) -> dict:
+    """Compute out-of-plane distance at ring junction atoms.
+
+    At each junction where a core ring atom (sp2) bonds to a fragment atom,
+    measures how far the fragment atom is from the ring plane. For good
+    geometry this should be ~0 A.
+
+    Args:
+        assembled_mol: assembled molecule with 3D coords
+        parent_mol: original parent molecule with 3D coords
+        match_atoms: tuple of atom indices in parent that were replaced
+
+    Returns:
+        dict with "max_oop" (max out-of-plane dist in A),
+        "mean_oop", "junction_details" (list of per-junction info)
+    """
+    if assembled_mol.GetNumConformers() == 0 or parent_mol.GetNumConformers() == 0:
+        return {"max_oop": None, "mean_oop": None, "junction_details": []}
+
+    parent_conf = parent_mol.GetConformer()
+    asm_conf = assembled_mol.GetConformer()
+    match_set = set(match_atoms)
+
+    # Find junction bonds in parent: core atom <-> substructure atom
+    junctions = []
+    for bond in parent_mol.GetBonds():
+        a1, a2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if (a1 in match_set) != (a2 in match_set):
+            core_idx = a1 if a1 not in match_set else a2
+            # Skip hydrogen core atoms
+            if parent_mol.GetAtomWithIdx(core_idx).GetAtomicNum() == 1:
+                continue
+            junctions.append(core_idx)
+
+    if not junctions:
+        return {"max_oop": 0.0, "mean_oop": 0.0, "junction_details": []}
+
+    # For each core junction atom, check if it's in a ring
+    ri_parent = parent_mol.GetRingInfo()
+    ri_asm = assembled_mol.GetRingInfo()
+
+    details = []
+    for core_idx in junctions:
+        # Find which ring(s) this atom is in
+        core_rings = [list(r) for r in ri_parent.AtomRings() if core_idx in r]
+        if not core_rings:
+            # Not in a ring — no planarity constraint
+            details.append({"core_atom": core_idx, "oop_dist": 0.0, "in_ring": False})
+            continue
+
+        # Use the smallest ring containing this atom
+        ring = min(core_rings, key=len)
+
+        # Find the corresponding atom in assembled mol by coordinate match
+        p_core = np.array(parent_conf.GetAtomPosition(core_idx))
+        asm_core_idx = None
+        for i in range(assembled_mol.GetNumAtoms()):
+            p2 = np.array(asm_conf.GetAtomPosition(i))
+            if np.linalg.norm(p_core - p2) < 0.05:
+                asm_core_idx = i
+                break
+
+        if asm_core_idx is None:
+            continue
+
+        # Find the ring in assembled mol containing this atom
+        asm_rings = [list(r) for r in ri_asm.AtomRings() if asm_core_idx in r]
+        if not asm_rings:
+            details.append({"core_atom": core_idx, "oop_dist": 0.0, "in_ring": False})
+            continue
+
+        asm_ring = min(asm_rings, key=len)
+
+        # Compute ring plane via SVD
+        ring_coords = np.array([asm_conf.GetAtomPosition(a) for a in asm_ring])
+        centroid = ring_coords.mean(axis=0)
+        centered = ring_coords - centroid
+        _, _, vt = np.linalg.svd(centered)
+        normal = vt[-1]
+
+        # Find fragment neighbors of the core junction atom
+        max_oop_this = 0.0
+        for nb in assembled_mol.GetAtomWithIdx(asm_core_idx).GetNeighbors():
+            nb_idx = nb.GetIdx()
+            nb_pos = np.array(asm_conf.GetAtomPosition(nb_idx))
+            # Check if fragment atom (not matching any parent atom position)
+            is_core = any(
+                np.linalg.norm(nb_pos - np.array(parent_conf.GetAtomPosition(j))) < 0.05
+                for j in range(parent_mol.GetNumAtoms())
+                if j not in match_set
+            )
+            if not is_core:
+                vec_to_frag = nb_pos - centroid
+                oop_dist = abs(float(np.dot(vec_to_frag, normal)))
+                max_oop_this = max(max_oop_this, oop_dist)
+
+        details.append({
+            "core_atom": core_idx,
+            "oop_dist": round(max_oop_this, 4),
+            "in_ring": True,
+        })
+
+    ring_details = [d for d in details if d["in_ring"]]
+    if ring_details:
+        oop_values = [d["oop_dist"] for d in ring_details]
+        return {
+            "max_oop": round(max(oop_values), 4),
+            "mean_oop": round(sum(oop_values) / len(oop_values), 4),
+            "junction_details": details,
+        }
+    return {"max_oop": 0.0, "mean_oop": 0.0, "junction_details": details}

@@ -392,10 +392,35 @@ For 2-AP fragments that are geometrically close but **too short** to span the fu
 
 ## Database Sources
 
-| Database | Fragmentation | Fragments | Description |
-|----------|--------------|-----------|-------------|
-| ChEMBL (hierarchical) | Hierarchical BRICS | ~2.3M | Drug-like molecules from ChEMBL 35 |
-| Approved drugs | BRICS | ~34K | FDA/EMA approved drugs |
-| Mcule | Reactive handles | ~91K | Commercial building blocks (6.5M input) |
-| SpiroChem | Reactive handles | ~4.2K | Specialty sp3-rich building blocks |
-| GDP/GDB-13 rings | C-H enumeration | On-the-fly | Pure carbon ring systems |
+### Fragment Counts
+
+ChEMBL 35 (2.2M drug-like molecules) produces **16M total fragments** via standard BRICS, or **2.3M** via hierarchical BRICS (max 2 cuts). The numbers below are for the **embedded screen databases** — subsets filtered by heavy atom count, rotatable bonds, and/or aromaticity, then embedded with 3D conformers:
+
+| Database | Fragmentation | Total frags | 1-AP | 2-AP | Conformers | Size |
+|----------|--------------|-------------|------|------|------------|------|
+| ChEMBL hierarchical screen | Hierarchical BRICS | 109K | 48K | 61K | 244K | 142 MB |
+| ChEMBL full RotBonds-1 screen | Standard BRICS | 254K | 115K | 104K | 706K | 593 MB |
+| ChEMBL RotBonds-2 screen | Standard BRICS | 182K | — | 182K | 182K | 210 MB |
+| Approved drugs screen | BRICS | 8.5K | 4.1K | 4.4K | 8.5K | 8 MB |
+| Mcule building blocks | Reactive handles | 91K | 78K | 11K | 250K | 170 MB |
+| Mcule keep-variants | Reactive handles | 52K | 46K | 5.9K | 179K | 110 MB |
+| SpiroChem building blocks | Reactive handles | 4.2K | 3.1K | 1.0K | 11K | 7 MB |
+| GDP/GDB-13 rings | C-H enumeration | — | — | — | — | On-the-fly |
+
+### Unembedded Fragments
+
+The full ChEMBL BRICS fragmentation produces **16M fragments** (7.1M 1-AP, 6.3M 2-AP, 2.7M 3+ AP), of which only ~700K are currently embedded with 3D conformers. The hierarchical BRICS database has **2.3M fragments** (966K 1-AP, 1.35M 2-AP), also mostly unembedded.
+
+### Conformer Generation Cost
+
+Embedding a single fragment with 5 conformers takes **~0.5 seconds** on average (varies with fragment size and ring complexity). At this rate:
+
+- **700K fragments** (current screen DBs): ~4 days on 1 CPU, ~12 hours on 8 CPUs
+- **2.3M fragments** (full hierarchical): ~13 days on 1 CPU, ~2 days on 8 CPUs
+- **16M fragments** (full BRICS): ~93 days on 1 CPU, ~12 days on 8 CPUs
+
+A fully embedded database of all 16M ChEMBL fragments at 5 conformers each would be approximately **50-60 GB**. In practice, pre-filtering by heavy atom count, rotatable bonds, or aromaticity reduces this by 5-10x.
+
+### Conformers Per Fragment
+
+5 conformers per fragment provides **3.2x more hits** than a single conformer (tested on a 2-AP linker replacement query), with the best geometric score improving from 0.44 to 0.17. The gains diminish beyond 5-10 conformers for most fragment sizes.

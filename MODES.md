@@ -394,18 +394,18 @@ For 2-AP fragments that are geometrically close but **too short** to span the fu
 
 ### Fragment Counts
 
-ChEMBL 35 (2.2M drug-like molecules) produces **16M total fragments** via standard BRICS, or **2.3M** via hierarchical BRICS (max 2 cuts). The numbers below are for the **embedded screen databases** — subsets filtered by heavy atom count, rotatable bonds, and/or aromaticity, then embedded with 3D conformers:
+ChEMBL 35 (2.2M drug-like molecules) produces **16M total fragments** via standard BRICS, or **2.3M** via hierarchical BRICS (max 2 cuts). The numbers below are for the **embedded screen databases** — subsets filtered and embedded with 3D conformers:
 
-| Database | Fragmentation | Total frags | 1-AP | 2-AP | Conformers | Size |
-|----------|--------------|-------------|------|------|------------|------|
-| ChEMBL hierarchical screen | Hierarchical BRICS | 109K | 48K | 61K | 244K | 142 MB |
-| ChEMBL full RotBonds-1 screen | Standard BRICS | 254K | 115K | 104K | 706K | 593 MB |
-| ChEMBL RotBonds-2 screen | Standard BRICS | 182K | — | 182K | 182K | 210 MB |
-| Approved drugs screen | BRICS | 8.5K | 4.1K | 4.4K | 8.5K | 8 MB |
-| Mcule building blocks | Reactive handles | 91K | 78K | 11K | 250K | 170 MB |
-| Mcule keep-variants | Reactive handles | 52K | 46K | 5.9K | 179K | 110 MB |
-| SpiroChem building blocks | Reactive handles | 4.2K | 3.1K | 1.0K | 11K | 7 MB |
-| GDP/GDB-13 rings | C-H enumeration | — | — | — | — | On-the-fly |
+| Database | Fragmentation | Total frags | 1-AP | 2-AP | Conformers | Size | Filters |
+|----------|--------------|-------------|------|------|------------|------|---------|
+| ChEMBL hierarchical screen | Hierarchical BRICS | 109K | 48K | 61K | 244K | 142 MB | HA ≤ 14, 1-2 AP, ArRings ≤ 1, RotBonds ≤ 2 |
+| ChEMBL RotBonds-1 screen | Standard BRICS | 254K | 115K | 104K | 706K | 593 MB | 1-3 AP, RotBonds ≤ 1 |
+| ChEMBL RotBonds-2 screen | Standard BRICS | 182K | — | 182K | 182K | 210 MB | HA ≤ 14, 2 AP only, non-aromatic, RotBonds ≤ 2 |
+| Approved drugs screen | BRICS | 8.5K | 4.1K | 4.4K | 8.5K | 8 MB | HA ≤ 14, 1-2 AP, ArRings ≤ 1 |
+| Mcule building blocks | Reactive handles | 91K | 78K | 11K | 250K | 170 MB | All converted handles (HA ≤ 14 from BB size) |
+| Mcule keep-variants | Reactive handles | 52K | 46K | 5.9K | 179K | 110 MB | Keep-variant handles only |
+| SpiroChem building blocks | Reactive handles | 4.2K | 3.1K | 1.0K | 11K | 7 MB | All converted handles |
+| GDP/GDB-13 rings | C-H enumeration | — | — | — | — | On-the-fly | Pure carbon rings, 5-10 atoms |
 
 ### Unembedded Fragments
 

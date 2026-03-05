@@ -12,7 +12,7 @@ from rdkit.Chem import Descriptors
 from caveat.geometry import embed_fragment, compute_vector_pair_descriptor
 from caveat.database import _find_attachment_points_in_mol, SCHEMA
 
-src = sqlite3.connect('/Users/rafal/repos/CAVEAT/approved_drugs_frags.db')
+src = sqlite3.connect('approved_drugs_frags.db')
 rows = src.execute('''
     SELECT canonical_smiles, num_heavy_atoms, num_attachment_points,
            brics_labels, source_count
@@ -31,7 +31,7 @@ src.close()
 print(f'Embedding {len(candidates)} fragments...')
 
 import os
-db_path = '/Users/rafal/repos/CAVEAT/approved_drugs_screen.db'
+db_path = 'approved_drugs_screen.db'
 if os.path.exists(db_path):
     os.remove(db_path)
 dst = sqlite3.connect(db_path)

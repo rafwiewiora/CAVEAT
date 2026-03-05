@@ -303,6 +303,14 @@ def _place_coordinates(
     conf.SetId(0)
     result_mol.AddConformer(conf, assignId=True)
 
+    # Step 4b: Enforce coplanarity at aromatic ring junctions
+    # Kabsch alignment is a least-squares fit that may place fragment atoms
+    # slightly out of the core ring plane. Project them back.
+    _enforce_junction_planarity(
+        result_mol, parent_mol, parent_conf, parent_map, repl_map,
+        cut_info, replacement_aps, n_atoms,
+    )
+
     # Step 5: Optional junction-only MMFF minimization
     if optimize:
         try:
@@ -310,7 +318,97 @@ def _place_coordinates(
         except Exception:
             pass  # keep unoptimized coordinates
 
+        # Step 5b: Re-enforce planarity after MMFF (it may drift during opt)
+        _enforce_junction_planarity(
+            result_mol, parent_mol, parent_conf, parent_map, repl_map,
+            cut_info, replacement_aps, n_atoms,
+        )
+
     return result_mol
+
+
+def _enforce_junction_planarity(
+    mol: Chem.Mol,
+    parent_mol: Chem.Mol,
+    parent_conf: Chem.Conformer,
+    parent_map: dict[int, int],
+    repl_map: dict[int, int],
+    cut_info: list[dict],
+    replacement_aps: list,
+    n_atoms: int,
+):
+    """Project fragment onto the plane of aromatic rings at each junction.
+
+    After Kabsch alignment, fragment neighbor atoms may be slightly out of
+    the plane of the core ring they attach to.  For each junction where the
+    parent external atom sits in an aromatic ring, compute the ring plane
+    and shift **all** fragment atoms by the average out-of-plane correction
+    so that the junction bonds are coplanar with the core.
+    """
+    conf = mol.GetConformer(0)
+    ring_info = parent_mol.GetRingInfo()
+
+    corrections = []
+    for ci, ap in zip(cut_info, replacement_aps):
+        ext_idx = ci["external_idx"]
+        ext_atom = parent_mol.GetAtomWithIdx(ext_idx)
+
+        if not ext_atom.GetIsAromatic():
+            continue
+
+        # Smallest aromatic ring containing the external atom
+        rings = [list(r) for r in ring_info.AtomRings() if ext_idx in r]
+        aromatic_rings = [
+            r for r in rings
+            if all(parent_mol.GetAtomWithIdx(a).GetIsAromatic() for a in r)
+        ]
+        if not aromatic_rings:
+            continue
+        ring = min(aromatic_rings, key=len)
+
+        # Ring plane from parent (ground truth)
+        ring_coords = np.array([
+            [parent_conf.GetAtomPosition(a).x,
+             parent_conf.GetAtomPosition(a).y,
+             parent_conf.GetAtomPosition(a).z]
+            for a in ring
+        ])
+        centroid = ring_coords.mean(axis=0)
+        _, _, vt = np.linalg.svd(ring_coords - centroid)
+        normal = vt[-1]
+
+        # Fragment neighbor position in the assembled molecule
+        frag_new_idx = repl_map.get(ap.neighbor_atom_idx)
+        if frag_new_idx is None or frag_new_idx >= n_atoms:
+            continue
+
+        frag_pos = np.array([
+            conf.GetAtomPosition(frag_new_idx).x,
+            conf.GetAtomPosition(frag_new_idx).y,
+            conf.GetAtomPosition(frag_new_idx).z,
+        ])
+
+        oop = float(np.dot(frag_pos - centroid, normal))
+        if abs(oop) < 0.01:
+            continue
+
+        corrections.append(-oop * normal)
+
+    if not corrections:
+        return
+
+    # Rigid-translate all fragment atoms by the average correction
+    avg = np.mean(corrections, axis=0)
+    for orig_idx in repl_map:
+        new_idx = repl_map[orig_idx]
+        if new_idx < n_atoms:
+            p = conf.GetAtomPosition(new_idx)
+            conf.SetAtomPosition(
+                new_idx,
+                Point3D(p.x + float(avg[0]),
+                        p.y + float(avg[1]),
+                        p.z + float(avg[2])),
+            )
 
 
 def _optimize_junction(
@@ -318,20 +416,22 @@ def _optimize_junction(
     parent_map: dict[int, int],
     repl_map: dict[int, int],
     n_atoms: int,
+    radius: int = 2,
+    max_iters: int = 500,
 ):
-    """MMFF minimize only atoms near the junction (within 1 bond of cut point).
+    """MMFF minimize atoms near the junction (within `radius` bonds of cut point).
 
-    All parent atoms and most fragment atoms are fixed; only atoms directly
-    at or adjacent to the junction bonds are allowed to move.
+    Atoms further from the junction are fixed; atoms within the radius can
+    relax to relieve strain at ring junctions (e.g., pyrazole planarity).
     """
     # Find junction atoms in the result mol: atoms that were connected across
     # parent ↔ fragment boundary
     junction_atoms = set()
+    parent_new = set(parent_map.values())
+    repl_new = set(repl_map.values())
     for atom in mol.GetAtoms():
         idx = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-        parent_new = set(parent_map.values())
-        repl_new = set(repl_map.values())
         # If this atom is in one set and has a neighbor in the other, it's a junction atom
         if idx in parent_new and any(n in repl_new for n in neighbors):
             junction_atoms.add(idx)
@@ -343,6 +443,20 @@ def _optimize_junction(
     if not junction_atoms:
         return
 
+    # Expand junction region to `radius` bonds from initial junction atoms
+    movable = set(junction_atoms)
+    frontier = set(junction_atoms)
+    for _ in range(radius - 1):
+        next_frontier = set()
+        for idx in frontier:
+            atom = mol.GetAtomWithIdx(idx)
+            for nb in atom.GetNeighbors():
+                nb_idx = nb.GetIdx()
+                if nb_idx not in movable and nb_idx < n_atoms:
+                    next_frontier.add(nb_idx)
+                    movable.add(nb_idx)
+        frontier = next_frontier
+
     # Add Hs for MMFF, optimize with fixed atoms, then remove Hs
     mol_h = Chem.AddHs(mol, addCoords=True)
     try:
@@ -353,17 +467,17 @@ def _optimize_junction(
         if ff is None:
             return
 
-        # Fix all heavy atoms except junction atoms
+        # Fix all heavy atoms except movable region
         for i in range(n_atoms):
-            if i not in junction_atoms:
+            if i not in movable:
                 ff.AddFixedPoint(i)
 
-        ff.Minimize(maxIts=200)
+        ff.Minimize(maxIts=max_iters)
 
-        # Copy back the optimized positions for junction atoms
+        # Copy back the optimized positions for all movable atoms
         conf_h = mol_h.GetConformer(0)
         conf = mol.GetConformer(0)
-        for idx in junction_atoms:
+        for idx in movable:
             if idx < n_atoms:
                 pos = conf_h.GetAtomPosition(idx)
                 conf.SetAtomPosition(idx, Point3D(pos.x, pos.y, pos.z))

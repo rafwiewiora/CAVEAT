@@ -47,10 +47,10 @@ import functools
 print = functools.partial(print, flush=True)
 
 # ─── Configuration ───────────────────────────────────────────────────────
-DB_PATH = "/Users/rafal/repos/CAVEAT/chembl_screen_rot1_5conf.db"
-PARENT_SDF = "/Users/rafal/repos/CAVEAT/results_tyrout_approved/parent.sdf"
-REPLACE_SMI = "COc1cnnc1"
-OUTDIR = "/Users/rafal/repos/CAVEAT/results_tyrout_2nd_order_v2"
+DB_PATH = "fragments.db"
+PARENT_SDF = "parent.sdf"
+REPLACE_SMI = "C1CNCCN1"  # substructure to replace (SMILES)
+OUTDIR = "results_2nd_order"
 NUM_WORKERS = 14
 N_CONFS = 5
 TOP_N = 99999  # assemble all hits

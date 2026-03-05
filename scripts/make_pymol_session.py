@@ -6,9 +6,9 @@ and writes everything out with a .pml loader script.
 
 Usage:
     python scripts/make_pymol_session.py \
-        --results-dir results_tyrout_approved2 \
-        --frags-db approved_drugs_frags.db \
-        --screen-db approved_drugs_screen.db
+        --results-dir results/ \
+        --frags-db fragments.db \
+        --screen-db screen.db
 """
 
 import argparse

@@ -13,7 +13,7 @@ Usage:
     python scripts/inspect_results.py \
         --db chembl_5k.db \
         --mol-sdf docked_ligand.sdf \
-        --replace "COc1cnnc1" \
+        --replace "C1CNCCN1" \
         --outdir results/ --top 100
 
 Produces:

@@ -5,7 +5,7 @@ with drug name, indication, and property information.
 
 Usage:
     python scripts/make_molstar_html.py \
-        --results-dir results_tyrout_approved2
+        --results-dir results/
 """
 
 import argparse

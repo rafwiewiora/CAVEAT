@@ -162,6 +162,174 @@ Combine two fragments to build novel replacements not found in any single databa
 
 ---
 
+## Geometric Matching (KD-Tree Search)
+
+For 2-AP fragments, CAVEAT computes a **4D geometric descriptor** from the two attachment vectors and uses a KD-tree for fast nearest-neighbor lookup across millions of fragments.
+
+### The 4D Descriptor
+
+Each pair of attachment vectors defines four measurements:
+
+```
+    Attachment vector pair on a fragment:
+
+                        exit vector 1               exit vector 2
+                             ↑                           ↑
+                           ext_A                       ext_B
+                            ╱                             ╲
+                     angle1╱                               ╲angle2
+                          ╱                                 ╲
+               [*]───── A ─ ─ ─ ─ distance ─ ─ ─ ─ B ─────[*]
+                         ╲                           ╱
+                          ╲       dihedral          ╱
+                           ╲    (twist angle)      ╱
+                            ╲       ╱             ╱
+                             plane1    plane2
+
+    4D descriptor = (distance, angle1, angle2, dihedral)
+
+        distance:  Å between neighbor atoms A and B
+        angle1:    degrees, ext_A – A – B
+        angle2:    degrees, A – B – ext_B
+        dihedral:  degrees, ext_A – A – B – ext_B (out-of-plane twist)
+```
+
+### KD-Tree Indexing
+
+All fragment descriptors are stored in a **KD-tree** (k-dimensional tree), a spatial data structure that enables O(log N) nearest-neighbor queries instead of O(N) brute-force search.
+
+```
+    Building the index:
+
+    For each fragment × each conformer:
+        compute 4D descriptor (dist, a1, a2, dih)
+              │
+              ▼
+        normalize:  [dist/1, a1/15, a2/15, dih/30]     ← weight angles less
+              │                                            (15° ~ 1 Å, 30° ~ 1 Å)
+              ▼
+        insert into KD-tree
+
+    ─────────────────────────────────────────────────────
+
+    Querying:
+
+    Substructure to replace
+              │
+              ▼
+    Compute reference 4D descriptor from parent 3D coords
+              │
+              ▼
+    Normalize with same weights
+              │
+              ▼
+    KD-tree nearest-neighbor search (k neighbors)
+              │
+              ▼
+    Rank by Euclidean distance in normalized space
+              │
+              ▼
+    Return top-k fragments sorted by geometric similarity score
+```
+
+The normalization weights (`distance/1`, `angle/15`, `dihedral/30`) reflect that a 15-degree angle deviation is roughly equivalent to a 1 Angstrom distance deviation for typical drug-like fragments, and dihedrals are more tolerant.
+
+---
+
+## 3D Fragment Alignment & Assembly
+
+After identifying geometrically compatible fragments, CAVEAT must **align** the fragment's 3D coordinates to the parent molecule and **stitch** them together. Different algorithms are used for 1-AP vs 2-AP:
+
+### 1-AP Alignment: Rodrigues' Rotation
+
+For single-attachment-point fragments, there's only one bond vector to match. The alignment uses **Rodrigues' rotation formula** — a closed-form method to compute the rotation matrix that maps one unit vector onto another.
+
+```
+    1-AP alignment steps:
+
+    Step 1: Translate                    Step 2: Rotate (Rodrigues)
+
+    Fragment:    [*]──N──(rest)          Fragment exit vector:  N → [*]
+                                         Target direction:      internal → external
+         move N to                            ↓
+         parent internal atom pos      Rodrigues' formula finds rotation R
+                 │                     that maps one vector onto the other:
+                 ▼
+    N lands at ● (internal atom)            axis = frag_vec × target_vec
+    [*] points wrong direction              angle = arccos(frag_vec · target_vec)
+                                            R = I + sin(θ)K + (1-cos(θ))K²
+                 │                              where K = skew-symmetric(axis)
+                 ▼
+                                    Step 3: Refine torsion around bond axis
+
+                                    Single-vector alignment leaves one degree
+                                    of freedom: rotation around the bond axis.
+
+                                    Scan torsion angles, pick the one that
+                                    best matches the parent's local geometry.
+
+         ● ─── N ──(rest)               ● ─── N ──(rest)
+        ╱       ↻                      ╱
+       ext    rotate around           ext     final
+              ●─N axis                        orientation
+```
+
+### 2+ AP Alignment: Kabsch Algorithm (SVD)
+
+For two or more attachment points, we have enough point correspondences for a **least-squares optimal rotation**. The Kabsch algorithm uses Singular Value Decomposition (SVD) to find the rotation matrix that minimizes RMSD between paired points.
+
+```
+    2-AP alignment via Kabsch:
+
+    Source points (fragment):           Target points (parent):
+
+       ext_A ── neighbor_A                 external_1 ── internal_1
+                     │                                       │
+               [fragment body]                        [cut bonds in parent]
+                     │                                       │
+       ext_B ── neighbor_B                 external_2 ── internal_2
+
+    Point pairs to align:
+       neighbor_A  →  internal_1     (fragment AP neighbor → parent internal)
+       dummy_A     →  external_1     (fragment dummy → parent external)
+       neighbor_B  →  internal_2
+       dummy_B     →  external_2
+
+    ──────────────────────────────────────────────────
+
+    Kabsch algorithm:
+
+    1. Compute centroids of source and target point sets
+    2. Center both sets (subtract centroids)
+    3. Compute cross-covariance matrix:   H = source_centered^T × target_centered
+    4. SVD decomposition:                 H = U × S × V^T
+    5. Optimal rotation:                  R = V × diag(1,1,det(VU^T)) × U^T
+    6. Translation:                       t = target_centroid - R × source_centroid
+
+    The diag(1,1,det) term prevents reflections (ensures proper rotation).
+    Result: rigid-body transform (R, t) that optimally superimposes
+    the fragment attachment vectors onto the parent cut bonds.
+```
+
+### Assembly (Stitching)
+
+After alignment, the fragment is stitched into the parent:
+
+```
+    Assembly process:
+
+    1. Copy all parent atoms (except matched substructure) with original coordinates
+    2. Copy all fragment atoms (except dummies) with aligned coordinates
+    3. Create new bonds at each junction:
+       parent external atom ──── fragment neighbor atom
+    4. Optional: MMFF force-field minimization of junction region
+       (atoms within 2 bonds of cut point can relax, everything else fixed)
+    5. Enforce coplanarity at aromatic ring junctions
+       (project fragment atoms onto ring plane if needed)
+```
+
+---
+
 ## Fragmentation Methods
 
 ### BRICS (Breaking of Retrosynthetically Interesting Chemical Substructures)
